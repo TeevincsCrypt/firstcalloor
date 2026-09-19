@@ -5,6 +5,9 @@ The X API and pump.fun are stubbed at the HTTP layer, so the search strategy
 network access or an API key.
 """
 
+import argparse
+import os
+import re
 import sys
 import unittest
 import urllib.parse
@@ -273,7 +276,8 @@ class TestSearchStrategy(unittest.TestCase):
         self.assertLess(pre[0].seconds_since_creation, 0)
 
     def test_retweet_detection_from_referenced_tweets(self):
-        built = fc.XSearchClient._build_mentions(
+        client = fc.XSearchClient("token")
+        built = client._build_mentions(
             [{
                 "id": "1", "author_id": "a", "created_at": fc.iso(ORIGIN),
                 "text": "RT ...",
@@ -283,7 +287,6 @@ class TestSearchStrategy(unittest.TestCase):
                    "created_at": fc.iso(ORIGIN - timedelta(hours=3)),
                    "public_metrics": {"followers_count": 7}}},
             ORIGIN,
-            datetime.now(timezone.utc),
         )
         self.assertTrue(built[0].is_retweet)
         self.assertLess(built[0].account_age_hours, fc.NEW_ACCOUNT_BOT_WINDOW_H)
@@ -311,6 +314,290 @@ class FakeRPC(fc.SolanaRPC):
 
 def sigs(n, start_id=0):
     return [{"signature": f"sig{start_id + i}", "blockTime": 1789842575 + i} for i in range(n)]
+
+
+class TestClampedWindowUsesTrueOrigin(unittest.TestCase):
+    """Regression test: when the recent-search lookback wall clamps the
+    search window forward (old token, X Basic), a mention's
+    seconds_since_creation must still be measured against the token's TRUE
+    launch time, never against the clamped window start. The two are equal
+    for a fresh token, which is why this needs its own old-token test - it's
+    exactly the case the window-expansion refactor could silently break.
+    """
+
+    def setUp(self):
+        self._real = fc.http_json
+
+    def tearDown(self):
+        fc.http_json = self._real
+
+    def test_clamped_window_still_measures_from_true_origin(self):
+        true_origin = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0)
+        # Somewhere inside the clamped (last-7-days) window, far from true_origin.
+        tweet_absolute_time = (datetime.now(timezone.utc) - timedelta(days=3)).replace(microsecond=0)
+        expected_seconds_since_launch = int((tweet_absolute_time - true_origin).total_seconds())
+
+        def fake(url, **kwargs):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            start = fc.parse_x_time(q["start_time"][0])
+            end = fc.parse_x_time(q["end_time"][0])
+            if not (start <= tweet_absolute_time < end):
+                return {"data": [], "includes": {"users": []}, "meta": {}}
+            return {
+                "data": [{
+                    "id": "t1", "author_id": "a",
+                    "created_at": fc.iso(tweet_absolute_time), "text": "old news",
+                }],
+                "includes": {"users": [{
+                    "id": "a", "username": "caller", "name": "Caller",
+                    "created_at": fc.iso(tweet_absolute_time - timedelta(days=900)),
+                    "public_metrics": {"followers_count": 100},
+                }]},
+                "meta": {},
+            }
+
+        fc.http_json = fake
+        client = fc.XSearchClient("token")  # full_archive=False -> 7-day wall applies
+        out = client.search(VALID_CA, true_origin)
+
+        self.assertEqual(len(out.mentions), 1)
+        # Must equal (tweet time - TRUE origin), never (tweet time - clamped
+        # window start, which sits ~23 days later than true_origin here).
+        self.assertEqual(out.mentions[0].seconds_since_creation, expected_seconds_since_launch)
+
+
+# --------------------------------------------------------------------------
+# twitterapi.io search strategy, stubbed at the HTTP layer
+#
+# NOTE: api.twitterapi.io is unreachable from the sandbox this was built in
+# (same network policy that blocks api.x.com and pump.fun), so this client
+# has never made a live call. The response shape below is built from
+# twitterapi.io's documented/expected format - a "tweets" list with
+# has_next_page/next_cursor pagination, classic Twitter-style timestamps
+# ("Wed Sep 19 18:30:16 +0000 2026" rather than ISO 8601), and a nested
+# author object. If the real API's field names differ even slightly, only
+# TwitterAPIIOClient._build_mentions and _parse_twitterapi_io_time need to
+# change - the earliest-first strategy itself is inherited, already covered,
+# and provider-agnostic.
+# --------------------------------------------------------------------------
+
+def _classic_twitter_time(dt: datetime) -> str:
+    return dt.strftime("%a %b %d %H:%M:%S +0000 %Y")
+
+
+class FakeTwitterAPIIO:
+    """Serves a fixed corpus of tweets honouring since_time:/until_time: query
+    operators and cursor pagination, in twitterapi.io's documented shape."""
+
+    def __init__(self, tweets, *, page_size=100, fail_after=None):
+        self.tweets = tweets           # list of (id, offset_seconds, author)
+        self.page_size = page_size
+        self.fail_after = fail_after
+        self.calls = 0
+        self.windows = []
+
+    def __call__(self, url, **kwargs):
+        self.calls += 1
+        if self.fail_after is not None and self.calls > self.fail_after:
+            raise fc.HttpError(429, "rate limited", url)
+
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        query_str = q["query"][0]
+        since = int(re.search(r"since_time:(\d+)", query_str).group(1))
+        until = int(re.search(r"until_time:(\d+)", query_str).group(1))
+        start = datetime.fromtimestamp(since, tz=timezone.utc)
+        end = datetime.fromtimestamp(until, tz=timezone.utc)
+        self.windows.append((start, end))
+
+        origin = ORIGIN
+        inside = [
+            t for t in self.tweets
+            if start <= origin + timedelta(seconds=t[1]) < end
+        ]
+        inside.sort(key=lambda t: -t[1])
+        offset = int(q.get("cursor", ["0"])[0])
+        page = inside[offset:offset + self.page_size]
+        next_offset = offset + len(page)
+
+        tweets_out = []
+        for tid, secs, author in page:
+            tweets_out.append({
+                "id": tid,
+                "text": f"mention {tid}",
+                "createdAt": _classic_twitter_time(origin + timedelta(seconds=secs)),
+                "url": f"https://x.com/{author}/status/{tid}",
+                "author": {
+                    "userName": author,
+                    "name": author,
+                    "followers": 500,
+                    "createdAt": _classic_twitter_time(origin - timedelta(days=900)),
+                },
+            })
+
+        has_more = next_offset < len(inside)
+        return {
+            "tweets": tweets_out,
+            "has_next_page": has_more,
+            "next_cursor": str(next_offset) if has_more else "",
+        }
+
+
+class TestTwitterAPIIOStrategy(unittest.TestCase):
+    def setUp(self):
+        self._real = fc.http_json
+
+    def tearDown(self):
+        fc.http_json = self._real
+
+    def _client(self, fake, **kw):
+        fc.http_json = fake
+        return fc.TwitterAPIIOClient("key", **kw)
+
+    def test_finds_earliest_mention_after_expanding_window(self):
+        fake = FakeTwitterAPIIO([("t1", 70 * 60, "a"), ("t2", 95 * 60, "b")])
+        out = self._client(fake).search(VALID_CA, ORIGIN)
+        self.assertEqual(out.status, "ok")
+        self.assertTrue(out.complete)
+        earliest = min(out.mentions, key=lambda m: m.created_unix)
+        self.assertEqual(earliest.tweet_id, "t1")
+        self.assertEqual(earliest.seconds_since_creation, 70 * 60)
+
+    def test_contracts_window_when_cap_is_hit(self):
+        corpus = [(f"t{i}", 60 + i * 50, f"a{i}") for i in range(400)]
+        fake = FakeTwitterAPIIO(corpus)
+        out = self._client(fake, cap=50).search(VALID_CA, ORIGIN)
+        earliest = min(out.mentions, key=lambda m: m.created_unix)
+        self.assertEqual(earliest.tweet_id, "t0")
+        self.assertLess(fake.windows[-1][1], fake.windows[0][1])
+
+    def test_rate_limit_midway_returns_partial_with_note(self):
+        corpus = [(f"t{i}", 60 + i * 10, f"a{i}") for i in range(500)]
+        fake = FakeTwitterAPIIO(corpus, fail_after=1)
+        out = self._client(fake, cap=300).search(VALID_CA, ORIGIN)
+        self.assertEqual(out.status, "partial")
+        self.assertFalse(out.complete)
+        self.assertTrue(any("cut short" in n for n in out.notes))
+        self.assertTrue(out.mentions)
+
+    def test_no_lookback_wall_on_a_very_old_token(self):
+        # The whole point of this provider: unlike X Basic, a token launched
+        # months ago is not clamped to a 7-day search window.
+        old_origin = datetime.now(timezone.utc) - timedelta(days=200)
+        fake = FakeTwitterAPIIO([])
+        out = self._client(fake).search(VALID_CA, old_origin)
+        self.assertFalse(any("7 day" in n or "lookback" in n for n in out.notes))
+        self.assertEqual(fc.parse_x_time(fc.iso(old_origin)),
+                          fc.parse_x_time(out.window_start_iso))
+
+    def test_zero_mentions_is_not_an_error(self):
+        out = self._client(FakeTwitterAPIIO([])).search(VALID_CA, ORIGIN)
+        self.assertEqual(out.mentions, [])
+        self.assertEqual(out.status, "ok")
+        self.assertEqual(out.provider, "twitterapi.io")
+
+    def test_pre_launch_probe_finds_recycled_ca_mentions(self):
+        fake = FakeTwitterAPIIO([("old1", -1800, "ghost"), ("t1", 60, "a")])
+        client = self._client(fake)
+        pre, _ = client.probe_before_launch(VALID_CA, ORIGIN, hours=6)
+        self.assertEqual([m.tweet_id for m in pre], ["old1"])
+        self.assertLess(pre[0].seconds_since_creation, 0)
+
+    def test_since_until_time_operators_bracket_the_window(self):
+        fake = FakeTwitterAPIIO([("t1", 120, "a")])
+        self._client(fake).search(VALID_CA, ORIGIN)
+        self.assertEqual(fake.windows[0][0], ORIGIN)
+
+
+class TestTwitterAPIIOParsing(unittest.TestCase):
+    def test_classic_twitter_date_format(self):
+        dt = fc._parse_twitterapi_io_time("Wed Sep 19 18:30:16 +0000 2026")
+        self.assertEqual(dt, datetime(2026, 9, 19, 18, 30, 16, tzinfo=timezone.utc))
+
+    def test_iso_fallback(self):
+        dt = fc._parse_twitterapi_io_time("2026-09-19T18:30:16.000Z")
+        self.assertEqual(dt, datetime(2026, 9, 19, 18, 30, 16, tzinfo=timezone.utc))
+
+    def test_unparseable_timestamp_raises_actionable_error(self):
+        with self.assertRaises(fc.FirstCallooorError) as ctx:
+            fc._parse_twitterapi_io_time("not-a-timestamp")
+        self.assertIn("not-a-timestamp", str(ctx.exception))
+
+    def test_pick_prefers_first_present_key(self):
+        self.assertEqual(fc._pick({"a": 1, "b": 2}, "z", "a", "b"), 1)
+        self.assertEqual(fc._pick({"b": 2}, "a", "b"), 2)
+        self.assertIsNone(fc._pick({}, "a", "b"))
+        self.assertEqual(fc._pick({"a": None, "b": 3}, "a", "b"), 3)
+
+    def test_build_mentions_tolerates_missing_optional_fields(self):
+        client = fc.TwitterAPIIOClient("key")
+        built = client._build_mentions(
+            [{"id": "1", "createdAt": _classic_twitter_time(ORIGIN), "text": "x",
+              "author": {"userName": "solo"}}],
+            ORIGIN,
+        )
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0].handle, "solo")
+        self.assertIsNone(built[0].followers)
+        self.assertIsNone(built[0].account_age_hours)
+
+    def test_build_mentions_skips_tweet_with_no_timestamp(self):
+        client = fc.TwitterAPIIOClient("key")
+        built = client._build_mentions(
+            [{"id": "1", "text": "no createdAt at all", "author": {"userName": "x"}}],
+            ORIGIN,
+        )
+        self.assertEqual(built, [])
+
+
+class TestProviderSelection(unittest.TestCase):
+    def setUp(self):
+        self._env_backup = {
+            k: os.environ.pop(k, None)
+            for k in ("X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN", "TWITTERAPI_IO_KEY", "TWITTERAPI_KEY")
+        }
+
+    def tearDown(self):
+        for k, v in self._env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    @staticmethod
+    def _args(provider="auto", bearer_token=None, twitterapi_key=None):
+        return argparse.Namespace(
+            provider=provider, bearer_token=bearer_token, twitterapi_key=twitterapi_key
+        )
+
+    def test_auto_prefers_twitterapi_io_when_both_configured(self):
+        os.environ["X_BEARER_TOKEN"] = "xtok"
+        os.environ["TWITTERAPI_IO_KEY"] = "tatok"
+        provider, cred = fc.select_provider(self._args())
+        self.assertEqual((provider, cred), ("twitterapi.io", "tatok"))
+
+    def test_auto_falls_back_to_x(self):
+        os.environ["X_BEARER_TOKEN"] = "xtok"
+        provider, cred = fc.select_provider(self._args())
+        self.assertEqual((provider, cred), ("x", "xtok"))
+
+    def test_auto_none_when_nothing_configured(self):
+        self.assertEqual(fc.select_provider(self._args()), ("none", None))
+
+    def test_explicit_provider_x_ignores_twitterapi_key(self):
+        os.environ["TWITTERAPI_IO_KEY"] = "tatok"
+        os.environ["X_BEARER_TOKEN"] = "xtok"
+        provider, cred = fc.select_provider(self._args(provider="x"))
+        self.assertEqual((provider, cred), ("x", "xtok"))
+
+    def test_explicit_provider_without_its_credential_is_none(self):
+        os.environ["X_BEARER_TOKEN"] = "xtok"
+        provider, cred = fc.select_provider(self._args(provider="twitterapi"))
+        self.assertEqual((provider, cred), ("none", None))
+
+    def test_cli_flag_overrides_environment(self):
+        os.environ["TWITTERAPI_IO_KEY"] = "env-key"
+        provider, cred = fc.select_provider(self._args(twitterapi_key="cli-key"))
+        self.assertEqual((provider, cred), ("twitterapi.io", "cli-key"))
 
 
 class TestOrigin(unittest.TestCase):

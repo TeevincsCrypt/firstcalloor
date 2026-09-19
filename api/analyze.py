@@ -16,6 +16,7 @@ from _engine import (
     FirstCallooorError,
     VERSION,
     run_analysis,
+    select_provider,
     validate_contract_address,
 )
 
@@ -29,7 +30,9 @@ WEB_TWEET_CAP = int(os.environ.get("FIRSTCALLOOR_MAX_TWEETS", str(DEFAULT_TWEET_
 def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
     return argparse.Namespace(
         rpc=os.environ.get("SOLANA_RPC_URL", DEFAULT_RPC),
-        bearer_token=None,                  # read from env inside run_analysis
+        provider="auto",                    # prefers twitterapi.io when configured
+        bearer_token=None,                  # read from env inside select_provider
+        twitterapi_key=None,                # read from env inside select_provider
         full_archive=full_archive,
         max_tweets=WEB_TWEET_CAP,
         sig_page_cap=WEB_SIG_PAGE_CAP,
@@ -72,9 +75,8 @@ def analyze_request(query: dict) -> tuple[int, dict]:
     except Exception as exc:  # never leak a traceback to the browser
         return 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
 
-    report["search"]["x_configured"] = bool(
-        os.environ.get("X_BEARER_TOKEN") or os.environ.get("TWITTER_BEARER_TOKEN")
-    )
+    configured_provider, _ = select_provider(args)
+    report["search"]["mentions_configured"] = configured_provider != "none"
     return (200 if outcome.complete else 206), report
 
 

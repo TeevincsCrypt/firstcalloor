@@ -171,8 +171,11 @@ function renderToken(d) {
   `);
 }
 
+const PROVIDER_LABEL = { "x": "X API v2", "twitterapi.io": "twitterapi.io", "mock": "mock fixtures" };
+
 function renderFirstCall(d) {
   const s = d.search;
+  const providerLabel = PROVIDER_LABEL[s.provider] || s.provider || null;
   if (!d.first_call) {
     const searchRan = !["no_credentials","forbidden","error"].includes(s.status);
     const head = searchRan
@@ -192,6 +195,7 @@ function renderFirstCall(d) {
     <div style="margin-top:10px"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a></div>
   `, "hero") + panel("Search", `
     <dl class="kv">
+      ${providerLabel ? `<dt>Provider</dt><dd>${esc(providerLabel)}</dd>` : ""}
       <dt>Query</dt><dd>${esc(s.query)} <span class="faint">(exact CA, never the ticker)</span></dd>
       <dt>Window</dt><dd class="muted">${esc(s.window_start)} &rarr; ${esc(s.window_end)}</dd>
       <dt>Coverage</dt><dd>${s.complete ? '<span class="ok">complete</span>'

@@ -520,6 +520,7 @@ class SearchOutcome:
     window_end_iso: Optional[str] = None
     query: Optional[str] = None
     endpoint: Optional[str] = None
+    provider: Optional[str] = None    # "x" | "twitterapi.io" | "mock"
 
 
 # Windows tried outward from launch until mentions appear. The first call for a
@@ -528,7 +529,152 @@ EXPAND_WINDOWS_H = [1, 6, 24, 72, 168]
 MIN_WINDOW_MINUTES = 5
 
 
-class XSearchClient:
+class BaseMentionSearchClient:
+    """Earliest-first search strategy, shared by every mention provider.
+
+    X API v2 has no ascending sort, and neither does twitterapi.io's search -
+    both return newest-first. Paginating a busy token that way would burn the
+    whole tweet cap on late mentions and never reach the first call. So instead:
+
+    1. Anchor a window at the launch timestamp.
+    2. Expand it outward (1h -> 6h -> 24h -> 72h -> 7d) only until mentions
+       appear - a fresh pump.fun token is usually called within minutes, so
+       this keeps quota spend low.
+    3. If that window overflows the tweet cap, contract it back toward launch
+       until the earliest tweets fit inside it.
+
+    Subclasses implement only `_fetch_window`, which knows one provider's
+    request shape and response fields; this class never sees either.
+    """
+
+    provider_name = "base"
+    cap = DEFAULT_TWEET_CAP
+    verbose = False
+    requests_made = 0
+    max_lookback_days: Optional[int] = None   # None = provider has no lookback wall
+
+    def _fetch_window(
+        self, ca: str, start: datetime, end: datetime, cap: int, origin_dt: datetime
+    ) -> tuple[list[Mention], bool, Optional[str]]:
+        """Collect every mention in [start, end), newest-first, up to `cap`.
+
+        `origin_dt` is the token's true creation time - NOT necessarily equal
+        to `start`, which may have been clamped forward by a lookback wall.
+        Every Mention's seconds_since_creation must be computed against
+        `origin_dt`, never against `start`, or a clamped search silently
+        mis-reports "seconds since launch" for every result it returns.
+
+        Returns (mentions, hit_cap, rate_limit_note). Must be implemented by
+        each provider subclass.
+        """
+        raise NotImplementedError
+
+    def search(self, ca: str, origin_dt: datetime) -> SearchOutcome:
+        now = datetime.now(timezone.utc)
+        notes: list[str] = []
+        start = origin_dt
+        endpoint = getattr(self, "endpoint", self.provider_name)
+
+        if self.max_lookback_days is not None:
+            earliest_allowed = now - timedelta(days=self.max_lookback_days)
+            if origin_dt < earliest_allowed:
+                start = earliest_allowed + timedelta(seconds=30)
+                notes.append(
+                    f"This token launched more than {self.max_lookback_days} days ago, "
+                    "which is outside this provider's lookback window. The search "
+                    "window was clamped, so the true first call is almost certainly "
+                    "NOT in these results."
+                )
+
+        window_h = EXPAND_WINDOWS_H[-1]
+        mentions: list[Mention] = []
+        hit_cap = False
+        rate_note: Optional[str] = None
+
+        # Expand outward from launch until we see something.
+        for hours in EXPAND_WINDOWS_H:
+            end = min(start + timedelta(hours=hours), now)
+            if end <= start:
+                continue
+            window_h = hours
+            mentions, hit_cap, rate_note = self._fetch_window(
+                ca, start, end, self.cap, origin_dt
+            )
+            if mentions or rate_note:
+                break
+
+        # Contract back toward launch if the window overflowed our cap, so the
+        # mentions we keep are the earliest rather than an arbitrary recent slice.
+        while hit_cap and not rate_note and window_h * 60 > MIN_WINDOW_MINUTES:
+            window_h = window_h / 4
+            end = min(start + timedelta(hours=window_h), now)
+            narrower, hit_cap, rate_note = self._fetch_window(
+                ca, start, end, self.cap, origin_dt
+            )
+            if not narrower:
+                # Nothing that close to launch; the wider set is the best we have.
+                hit_cap = True
+                notes.append(
+                    f"Mention volume exceeded the {self.cap}-tweet cap and no mentions "
+                    f"exist within {fmt_delta(window_h * 3600)} of launch, so the "
+                    "earliest mentions shown may not be the absolute earliest."
+                )
+                break
+            mentions = narrower
+
+        if rate_note:
+            notes.append(rate_note)
+
+        end_dt = min(start + timedelta(hours=window_h), now)
+        complete = not hit_cap and rate_note is None
+
+        if hit_cap and not rate_note:
+            notes.append(
+                f"The {self.cap}-tweet cap was reached; raise it with --max-tweets "
+                "if you want a deeper sweep."
+            )
+
+        return SearchOutcome(
+            status="ok" if complete else "partial",
+            mentions=mentions,
+            notes=notes,
+            complete=complete,
+            requests_made=self.requests_made,
+            window_start_iso=iso(start),
+            window_end_iso=iso(end_dt),
+            query=f'"{ca}"',
+            endpoint=endpoint,
+            provider=self.provider_name,
+        )
+
+    def probe_before_launch(
+        self, ca: str, origin_dt: datetime, hours: int
+    ) -> tuple[list[Mention], list[str]]:
+        """Look for mentions that predate the token, to expose recycled CAs."""
+        if hours <= 0:
+            return [], []
+        now = datetime.now(timezone.utc)
+        start = origin_dt - timedelta(hours=hours)
+        if self.max_lookback_days is not None:
+            floor = now - timedelta(days=self.max_lookback_days) + timedelta(seconds=30)
+            start = max(start, floor)
+        if start >= origin_dt:
+            return [], [
+                "Pre-launch probe skipped: the window before launch falls outside "
+                "this provider's lookback horizon."
+            ]
+        try:
+            mentions, _, rate_note = self._fetch_window(
+                ca, start, origin_dt, min(50, self.cap), origin_dt
+            )
+        except HttpError as exc:
+            return [], [f"Pre-launch probe failed (HTTP {exc.status}); skipped."]
+        return mentions, ([rate_note] if rate_note else [])
+
+
+class XSearchClient(BaseMentionSearchClient):
+    provider_name = "x"
+
     def __init__(
         self,
         bearer_token: str,
@@ -540,6 +686,7 @@ class XSearchClient:
         self.token = bearer_token
         self.endpoint = X_SEARCH_ALL if full_archive else X_SEARCH_RECENT
         self.full_archive = full_archive
+        self.max_lookback_days = None if full_archive else 7
         self.cap = cap
         self.verbose = verbose
         self.requests_made = 0
@@ -552,12 +699,8 @@ class XSearchClient:
         return http_json(url, headers={"Authorization": f"Bearer {self.token}"})
 
     def _fetch_window(
-        self, ca: str, start: datetime, end: datetime, cap: int
-    ) -> tuple[list[dict], dict[str, dict], bool, Optional[str]]:
-        """Collect every tweet in [start, end), newest-first, up to `cap`.
-
-        Returns (tweets, users_by_id, hit_cap, rate_limit_note).
-        """
+        self, ca: str, start: datetime, end: datetime, cap: int, origin_dt: datetime
+    ) -> tuple[list[Mention], bool, Optional[str]]:
         tweets: list[dict] = []
         users: dict[str, dict] = {}
         next_token: Optional[str] = None
@@ -602,128 +745,18 @@ class XSearchClient:
 
             next_token = (data.get("meta") or {}).get("next_token")
             if not next_token or not batch:
-                return tweets, users, False, rate_note
-
-        return tweets, users, next_token is not None, rate_note
-
-    # -- strategy ----------------------------------------------------------
-
-    def search(self, ca: str, origin_dt: datetime) -> SearchOutcome:
-        """Find the EARLIEST mentions, not merely 200 recent ones.
-
-        X v2 has no ascending sort, so paginating a busy token newest-first
-        would burn the cap on late mentions and never reach the first call.
-        Instead we anchor a window at the launch timestamp, expand it outward
-        only until mentions appear, and if that window overflows the cap we
-        contract it back toward launch until the earliest tweets fit.
-        """
-        now = datetime.now(timezone.utc)
-        notes: list[str] = []
-        start = origin_dt
-
-        if not self.full_archive:
-            earliest_allowed = now - timedelta(days=7)
-            if origin_dt < earliest_allowed:
-                start = earliest_allowed + timedelta(seconds=30)
-                notes.append(
-                    "This token launched more than 7 days ago, which is outside the "
-                    "recent-search window. The search window was clamped to the last "
-                    "7 days, so the true first call is almost certainly NOT in these "
-                    "results. Full-archive search (X API Pro) is required for a "
-                    "trustworthy answer on a token this old."
-                )
-
-        window_h = EXPAND_WINDOWS_H[-1]
-        tweets: list[dict] = []
-        users: dict[str, dict] = {}
-        hit_cap = False
-        rate_note: Optional[str] = None
-
-        # Expand outward from launch until we see something.
-        for hours in EXPAND_WINDOWS_H:
-            end = min(start + timedelta(hours=hours), now)
-            if end <= start:
-                continue
-            window_h = hours
-            tweets, users, hit_cap, rate_note = self._fetch_window(ca, start, end, self.cap)
-            if tweets or rate_note:
                 break
+        else:
+            return self._build_mentions(tweets, users, origin_dt), next_token is not None, rate_note
 
-        # Contract back toward launch if the window overflowed our cap, so the
-        # tweets we keep are the earliest rather than an arbitrary recent slice.
-        while hit_cap and not rate_note and window_h * 60 > MIN_WINDOW_MINUTES:
-            window_h = window_h / 4
-            end = min(start + timedelta(hours=window_h), now)
-            narrower, narrower_users, hit_cap, rate_note = self._fetch_window(
-                ca, start, end, self.cap
-            )
-            if not narrower:
-                # Nothing that close to launch; the wider set is the best we have.
-                hit_cap = True
-                notes.append(
-                    f"Mention volume exceeded the {self.cap}-tweet cap and no mentions "
-                    f"exist within {fmt_delta(window_h * 3600)} of launch, so the "
-                    "earliest mentions shown may not be the absolute earliest."
-                )
-                break
-            tweets, users = narrower, narrower_users
-
-        if rate_note:
-            notes.append(rate_note)
-
-        mentions = self._build_mentions(tweets, users, origin_dt, now)
-        end_dt = min(start + timedelta(hours=window_h), now)
-        complete = not hit_cap and rate_note is None
-
-        if hit_cap and not rate_note:
-            notes.append(
-                f"The {self.cap}-tweet cap was reached; raise it with --max-tweets "
-                "if you want a deeper sweep."
-            )
-
-        return SearchOutcome(
-            status="ok" if complete else "partial",
-            mentions=mentions,
-            notes=notes,
-            complete=complete,
-            requests_made=self.requests_made,
-            window_start_iso=iso(start),
-            window_end_iso=iso(end_dt),
-            query=f'"{ca}"',
-            endpoint=self.endpoint,
-        )
-
-    def probe_before_launch(
-        self, ca: str, origin_dt: datetime, hours: int
-    ) -> tuple[list[Mention], list[str]]:
-        """Look for mentions that predate the token, to expose recycled CAs."""
-        if hours <= 0:
-            return [], []
-        now = datetime.now(timezone.utc)
-        start = origin_dt - timedelta(hours=hours)
-        if not self.full_archive:
-            floor = now - timedelta(days=7) + timedelta(seconds=30)
-            start = max(start, floor)
-        if start >= origin_dt:
-            return [], [
-                "Pre-launch probe skipped: the window before launch falls outside "
-                "the recent-search 7-day horizon."
-            ]
-        try:
-            tweets, users, _, rate_note = self._fetch_window(
-                ca, start, origin_dt, min(50, self.cap)
-            )
-        except HttpError as exc:
-            return [], [f"Pre-launch probe failed (HTTP {exc.status}); skipped."]
-        notes = [rate_note] if rate_note else []
-        return self._build_mentions(tweets, users, origin_dt, now), notes
+        return self._build_mentions(tweets, users, origin_dt), False, rate_note
 
     # -- shaping -----------------------------------------------------------
 
-    @staticmethod
     def _build_mentions(
-        tweets: list[dict], users: dict[str, dict], origin_dt: datetime, now: datetime
+        self, tweets: list[dict], users: dict[str, dict], origin_dt: datetime
     ) -> list[Mention]:
+        now = datetime.now(timezone.utc)
         out: list[Mention] = []
         for tw in tweets:
             author = users.get(tw.get("author_id", ""), {})
@@ -757,6 +790,180 @@ class XSearchClient:
                     is_retweet="retweeted" in ref_types,
                     is_quote="quoted" in ref_types,
                     is_reply="replied_to" in ref_types,
+                )
+            )
+        return out
+
+
+# --------------------------------------------------------------------------
+# twitterapi.io - third-party X search, no official-tier 7-day wall
+# --------------------------------------------------------------------------
+
+TWITTERAPI_IO_SEARCH = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+
+# Twitter's classic tweet timestamp format, e.g. "Wed Sep 19 18:30:16 +0000 2026".
+# twitterapi.io passes this format through as-is rather than converting to ISO.
+_TWITTERAPI_IO_DATE_FMT = "%a %b %d %H:%M:%S %z %Y"
+
+
+def _parse_twitterapi_io_time(value: str) -> datetime:
+    """Parse a twitterapi.io timestamp, tolerating ISO 8601 as a fallback.
+
+    Not verified against a live response (this sandbox cannot reach
+    api.twitterapi.io) - built from the documented/expected response shape.
+    If the real API returns something this can't parse, the error message
+    names the offending value so it's a quick fix rather than a mystery.
+    """
+    try:
+        return datetime.strptime(value, _TWITTERAPI_IO_DATE_FMT).astimezone(timezone.utc)
+    except ValueError:
+        pass
+    try:
+        return parse_x_time(value)
+    except ValueError as exc:
+        raise FirstCallooorError(
+            f"twitterapi.io returned a timestamp we don't recognise: {value!r} "
+            f"({exc}). The response schema may have changed - please report this "
+            "value so the parser can be updated."
+        ) from exc
+
+
+def _pick(d: dict, *keys, default=None):
+    """First present key from a dict, tolerating a couple of naming variants.
+
+    twitterapi.io's exact field names are taken from its documented shape,
+    which this sandbox cannot call live to confirm; this hedges against a
+    plausible camelCase/snake_case mismatch without guessing wildly.
+    """
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+class TwitterAPIIOClient(BaseMentionSearchClient):
+    """Third-party X search via twitterapi.io (api.twitterapi.io).
+
+    Unofficial reseller of X's search index, priced per request/credit rather
+    than a fixed monthly tier. Used here because it has no equivalent of the
+    official API's 7-day recent-search wall, which is what actually blocks
+    "first call" lookups on a token that already ran. Time-boxes a query with
+    the `since_time:`/`until_time:` (unix epoch) search operators rather than
+    dedicated start/end parameters.
+    """
+
+    provider_name = "twitterapi.io"
+    endpoint = TWITTERAPI_IO_SEARCH
+    max_lookback_days = None   # no recent-search wall on this provider
+
+    def __init__(self, api_key: str, *, cap: int = DEFAULT_TWEET_CAP, verbose: bool = False):
+        self.api_key = api_key
+        self.cap = cap
+        self.verbose = verbose
+        self.requests_made = 0
+
+    def _page(self, query: str, cursor: str) -> dict:
+        params = {"query": query, "queryType": "Latest"}
+        if cursor:
+            params["cursor"] = cursor
+        url = f"{self.endpoint}?{urllib.parse.urlencode(params)}"
+        self.requests_made += 1
+        return http_json(url, headers={"X-API-Key": self.api_key})
+
+    def _fetch_window(
+        self, ca: str, start: datetime, end: datetime, cap: int, origin_dt: datetime
+    ) -> tuple[list[Mention], bool, Optional[str]]:
+        query = f'"{ca}" since_time:{int(start.timestamp())} until_time:{int(end.timestamp())}'
+        raw: list[dict] = []
+        cursor = ""
+        rate_note: Optional[str] = None
+        has_next = False
+
+        # Unlike X's max_results, twitterapi.io's advanced_search takes no
+        # page-size parameter - a single page can overshoot `cap` outright.
+        # So "the server says there's no more" is NOT the same claim as "we
+        # captured everything": if this page alone exceeded cap, results were
+        # truncated client-side and must still be reported as hit_cap=True,
+        # or a busy window silently drops exactly the earliest tweets in it.
+        while len(raw) < cap:
+            try:
+                data = self._page(query, cursor)
+            except HttpError as exc:
+                if exc.status == 429:
+                    rate_note = (
+                        "twitterapi.io rate limit reached mid-pagination - the search "
+                        "was cut short and these results may be incomplete."
+                    )
+                    break
+                raise
+
+            batch = _pick(data, "tweets", "data", default=[]) or []
+            raw.extend(batch)
+
+            if self.verbose:
+                print(
+                    f"  [twitterapi.io] {iso(start)} -> {iso(end)}: +{len(batch)} "
+                    f"(total {len(raw)})",
+                    file=sys.stderr,
+                )
+
+            has_next = bool(_pick(data, "has_next_page", "hasNextPage", default=False))
+            cursor = _pick(data, "next_cursor", "nextCursor", default="") or ""
+            if not has_next or not cursor or not batch:
+                break
+
+        hit_cap = has_next or len(raw) > cap
+        return self._build_mentions(raw[:cap], origin_dt), hit_cap, rate_note
+
+    # -- shaping -----------------------------------------------------------
+
+    def _build_mentions(self, tweets: list[dict], origin_dt: datetime) -> list[Mention]:
+        now = datetime.now(timezone.utc)
+        out: list[Mention] = []
+        for tw in tweets:
+            author = _pick(tw, "author", "user", default={}) or {}
+            handle = _pick(author, "userName", "username", "screen_name", default="unknown")
+            created_raw = _pick(tw, "createdAt", "created_at")
+            if not created_raw:
+                continue
+            created = _parse_twitterapi_io_time(created_raw)
+
+            acct_created_iso = None
+            acct_age_h = None
+            acct_raw = _pick(author, "createdAt", "created_at")
+            if acct_raw:
+                acct_dt = _parse_twitterapi_io_time(acct_raw)
+                acct_created_iso = iso(acct_dt)
+                acct_age_h = round((now - acct_dt).total_seconds() / 3600, 2)
+
+            tweet_id = str(_pick(tw, "id", "tweetId", "id_str", default=""))
+            is_retweet = bool(
+                _pick(tw, "isRetweet", default=False) or _pick(tw, "retweeted_tweet")
+            )
+            is_quote = bool(
+                _pick(tw, "isQuote", default=False) or _pick(tw, "quoted_tweet")
+            )
+            is_reply = bool(
+                _pick(tw, "isReply", default=False) or _pick(tw, "inReplyToId")
+            )
+
+            out.append(
+                Mention(
+                    tweet_id=tweet_id,
+                    handle=handle,
+                    display_name=_pick(author, "name", default="") or "",
+                    author_id=str(_pick(author, "id", "userId", default="")),
+                    followers=_pick(author, "followers", "followers_count", "followersCount"),
+                    account_created_iso=acct_created_iso,
+                    account_age_hours=acct_age_h,
+                    created_iso=iso(created),
+                    created_unix=int(created.timestamp()),
+                    seconds_since_creation=int((created - origin_dt).total_seconds()),
+                    url=_pick(tw, "url", "twitterUrl", default=f"https://x.com/{handle}/status/{tweet_id}"),
+                    text=_pick(tw, "text", "full_text", default=""),
+                    is_retweet=is_retweet,
+                    is_quote=is_quote,
+                    is_reply=is_reply,
                 )
             )
         return out
@@ -828,6 +1035,7 @@ def mock_search(ca: str, origin_dt: datetime, seed: int = 7) -> SearchOutcome:
         ],
         complete=True,
         requests_made=0,
+        provider="mock",
         window_start_iso=iso(origin_dt - timedelta(hours=2)),
         window_end_iso=iso(origin_dt + timedelta(hours=6)),
         query=f'"{ca}"',
@@ -964,6 +1172,10 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
 
     # -- search ------------------------------------------------------------
     section("search")
+    provider_label = {"x": "X API v2", "twitterapi.io": "twitterapi.io", "mock": "mock fixtures"}.get(
+        outcome.provider, outcome.provider or "-"
+    )
+    print(f"  {'Provider':<18}{provider_label}")
     print(f"  {'Query':<18}{outcome.query}   {dim('(exact CA string, never the ticker)')}")
     print(f"  {'Endpoint':<18}{dim(outcome.endpoint or '-')}")
     print(f"  {'Window':<18}{outcome.window_start_iso}  ->  {outcome.window_end_iso}")
@@ -1077,6 +1289,7 @@ def build_report(
         },
         "search": {
             "status": outcome.status,
+            "provider": outcome.provider,
             "complete": outcome.complete,
             "endpoint": outcome.endpoint,
             "query": outcome.query,
@@ -1105,22 +1318,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "environment:\n"
-            "  X_BEARER_TOKEN    X API v2 bearer token (search access required)\n"
-            "  SOLANA_RPC_URL    Solana RPC endpoint (default: public mainnet)\n\n"
+            "  TWITTERAPI_IO_KEY  twitterapi.io API key (no 7-day lookback wall)\n"
+            "  X_BEARER_TOKEN     X API v2 bearer token (search access required)\n"
+            "  SOLANA_RPC_URL     Solana RPC endpoint (default: public mainnet)\n\n"
+            "provider (auto by default): twitterapi.io is preferred when configured,\n"
+            "since it has no equivalent of the official API's 7-day recent-search\n"
+            "wall; falls back to X, then to no search.\n\n"
             "exit codes:\n"
             "  0 complete   2 bad input   3 incomplete search   1 error\n"
         ),
     )
     p.add_argument("contract_address", help="Solana token mint address (base58, 32-44 chars)")
     p.add_argument("--mock", action="store_true",
-                   help="use synthetic mentions instead of the X API (no key needed)")
+                   help="use synthetic mentions instead of a real search (no key needed)")
     p.add_argument("--json", dest="json_path", default=None,
                    help="write the full result set here (default: firstcalloor-<ca8>.json)")
     p.add_argument("--rpc", default=os.environ.get("SOLANA_RPC_URL", DEFAULT_RPC),
                    help="Solana RPC endpoint")
+    p.add_argument("--provider", choices=["auto", "x", "twitterapi"], default="auto",
+                   help="mention-search provider (default: auto-detect from credentials)")
+    p.add_argument("--twitterapi-key", default=None,
+                   help="twitterapi.io API key (overrides TWITTERAPI_IO_KEY)")
     p.add_argument("--bearer-token", default=None, help="X API bearer token (overrides env)")
     p.add_argument("--full-archive", action="store_true",
-                   help="use /2/tweets/search/all instead of recent search (X API Pro+)")
+                   help="use /2/tweets/search/all instead of recent search (X API Pro+; "
+                        "no effect on twitterapi.io, which has no such split)")
     p.add_argument("--max-tweets", type=int, default=DEFAULT_TWEET_CAP,
                    help=f"cap on tweets fetched (default {DEFAULT_TWEET_CAP})")
     p.add_argument("--sig-page-cap", type=int, default=DEFAULT_SIG_PAGE_CAP,
@@ -1134,6 +1356,44 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def select_provider(args: argparse.Namespace) -> tuple[str, Optional[str]]:
+    """Pick a mention-search provider and its credential.
+
+    Returns (provider, credential); provider is "x", "twitterapi.io", or
+    "none". An explicit --provider wins. Auto-detection prefers twitterapi.io
+    when configured, since - unlike the official API's free/Basic tiers - it
+    has no 7-day recent-search wall, which is what actually blocks a "first
+    call" lookup on a token that already ran; it falls back to X, then to no
+    search at all.
+    """
+    x_token = getattr(args, "bearer_token", None) or os.environ.get(
+        "X_BEARER_TOKEN"
+    ) or os.environ.get("TWITTER_BEARER_TOKEN")
+    ta_key = getattr(args, "twitterapi_key", None) or os.environ.get(
+        "TWITTERAPI_IO_KEY"
+    ) or os.environ.get("TWITTERAPI_KEY")
+
+    requested = getattr(args, "provider", "auto")
+    if requested == "x":
+        return ("x", x_token) if x_token else ("none", None)
+    if requested == "twitterapi":
+        return ("twitterapi.io", ta_key) if ta_key else ("none", None)
+
+    if ta_key:
+        return "twitterapi.io", ta_key
+    if x_token:
+        return "x", x_token
+    return "none", None
+
+
+def _build_search_client(provider: str, credential: str, args: argparse.Namespace):
+    if provider == "twitterapi.io":
+        return TwitterAPIIOClient(credential, cap=args.max_tweets, verbose=args.verbose)
+    return XSearchClient(
+        credential, full_archive=args.full_archive, cap=args.max_tweets, verbose=args.verbose
+    )
+
+
 def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, SearchOutcome,
                                                               OnChainOrigin, CrossCheck]:
     """Full pipeline for an already-validated CA.
@@ -1141,9 +1401,7 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     Shared by the CLI and the serverless API so the website and the terminal
     can never disagree about what a result means.
     """
-    token = getattr(args, "bearer_token", None) or os.environ.get(
-        "X_BEARER_TOKEN"
-    ) or os.environ.get("TWITTER_BEARER_TOKEN")
+    provider, credential = select_provider(args)
 
     # 1. zero point, straight from the chain
     if args.verbose:
@@ -1158,11 +1416,11 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
         else cross_check_pumpfun(ca, origin.created_unix)
     )
 
-    # 3. X search
-    endpoint = X_SEARCH_ALL if args.full_archive else X_SEARCH_RECENT
+    # 3. mention search
     now_iso = iso(datetime.now(timezone.utc))
 
-    def stub(status: str, notes: list[str], requests_made: int = 0) -> SearchOutcome:
+    def stub(status: str, notes: list[str], requests_made: int = 0,
+              endpoint: Optional[str] = None) -> SearchOutcome:
         return SearchOutcome(
             status=status,
             complete=False,
@@ -1172,50 +1430,57 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
             window_end_iso=now_iso,
             requests_made=requests_made,
             notes=notes,
+            provider=None if provider == "none" else provider,
         )
 
     if getattr(args, "mock", False):
         outcome = mock_search(ca, origin_dt)
-    elif not token:
+    elif provider == "none":
         outcome = stub("no_credentials", [
-            "No X API bearer token is configured, so no mention search ran. The "
+            "No mention-search credentials are configured, so no search ran. The "
             "on-chain zero point above is still accurate.",
-            "Set X_BEARER_TOKEN to a key with search access - the X free tier has "
-            "none, so this needs Basic or above, or a third-party X search "
-            "provider.",
+            "Set TWITTERAPI_IO_KEY (twitterapi.io - no 7-day lookback wall) or "
+            "X_BEARER_TOKEN (official X API - the free tier has no search access "
+            "at all) to enable it.",
         ])
     else:
-        client = XSearchClient(
-            token,
-            full_archive=args.full_archive,
-            cap=args.max_tweets,
-            verbose=args.verbose,
-        )
+        client = _build_search_client(provider, credential, args)
         try:
             outcome = client.search(ca, origin_dt)
             pre, pre_notes = client.probe_before_launch(ca, origin_dt, args.pre_window_hours)
             outcome.mentions.extend(pre)
             outcome.notes.extend(pre_notes)
             outcome.requests_made = client.requests_made
-        except HttpError as exc:
-            if exc.status == 403:
-                outcome = stub("forbidden", [
-                    "X returned 403. The free tier has no search access at all; "
-                    "recent search needs Basic or above, and full-archive search "
-                    "needs Pro."
-                ], client.requests_made)
-            elif exc.status == 401:
-                outcome = stub("forbidden", [
-                    "X returned 401 - the bearer token was rejected. Check that "
-                    "X_BEARER_TOKEN is the app's Bearer Token, not an API key or "
-                    "secret."
-                ], client.requests_made)
-            else:
+        except (HttpError, FirstCallooorError) as exc:
+            # A search-stage failure degrades the result, it never aborts the
+            # run - the on-chain half above is still real and worth reporting.
+            endpoint = getattr(client, "endpoint", None)
+            if isinstance(exc, HttpError) and exc.status in (401, 403):
+                hints = {
+                    "x": (
+                        "X returned 403. The free tier has no search access at all; "
+                        "recent search needs Basic or above, and full-archive search "
+                        "needs Pro."
+                        if exc.status == 403 else
+                        "X returned 401 - the bearer token was rejected. Check that "
+                        "X_BEARER_TOKEN is the app's Bearer Token, not an API key or "
+                        "secret."
+                    ),
+                    "twitterapi.io": (
+                        f"twitterapi.io returned {exc.status}. Check that "
+                        "TWITTERAPI_IO_KEY is correct and the account still has "
+                        "credits remaining."
+                    ),
+                }
+                outcome = stub("forbidden", [hints[provider]], client.requests_made, endpoint)
+            elif isinstance(exc, HttpError):
                 outcome = stub(
                     "error",
-                    [f"X search failed: HTTP {exc.status} {squash(exc.body, 200)}"],
-                    client.requests_made,
+                    [f"{provider} search failed: HTTP {exc.status} {squash(exc.body, 200)}"],
+                    client.requests_made, endpoint,
                 )
+            else:
+                outcome = stub("error", [str(exc)], client.requests_made, endpoint)
 
     triage = triage_mentions(outcome.mentions, include_retweets=args.include_retweets)
     report = build_report(ca, origin, cross, outcome, triage, args)

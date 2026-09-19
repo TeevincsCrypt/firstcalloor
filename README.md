@@ -48,8 +48,9 @@ Then set environment variables under **Settings → Environment Variables**:
 | Variable | Needed? | Why |
 |---|---|---|
 | `SOLANA_RPC_URL` | **Strongly recommended** | The default public RPC rate-limits cloud IPs hard; a hosted deploy will hit 429s without a dedicated endpoint. A free Helius key is enough. |
-| `X_BEARER_TOKEN` | Required for mentions | Without it the site shows on-chain data only. |
-| `X_FULL_ARCHIVE` | Optional | `1` to use full-archive search (X API Pro). |
+| `TWITTERAPI_IO_KEY` | Preferred for mentions | Preferred over `X_BEARER_TOKEN` when both are set — no 7-day lookback wall. Without either, the site shows on-chain data only. |
+| `X_BEARER_TOKEN` | Fallback for mentions | Used only if `TWITTERAPI_IO_KEY` is unset. |
+| `X_FULL_ARCHIVE` | Optional | `1` to use full-archive search on the official X API (Pro tier). No effect on twitterapi.io. |
 | `FIRSTCALLOOR_SIG_PAGE_CAP` | Optional | Signature pages per request, default `12`. Lower it if you hit the function timeout. |
 
 **Serverless timeouts matter here.** Walking a busy token's signature history
@@ -66,38 +67,65 @@ api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
 api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
 firstcalloor.py      CLI wrapper around that same engine
 dev_server.py        local server mirroring Vercel's routing
-tests/               33 tests, no network or API key needed
+tests/               53 tests, no network or API key needed
 ```
 
 ---
 
 ## What you need to provide
 
-### 1. X (Twitter) API key — the hard requirement
+### 1. A mention-search provider — the hard requirement
 
-This is the part that gates everything. **The X free tier has no search access
-at all** (it is post-only, 100 reads/month), so FIRSTCALLOOR cannot find
-mentions on it. Your options:
+This is the part that gates everything. FIRSTCALLOOR supports two providers
+and auto-detects whichever is configured; if both are, **twitterapi.io is
+preferred**, since it has no equivalent of the official API's 7-day wall —
+which is what actually blocks a "first call" lookup on a token that already
+ran, i.e. the normal case someone asks this question about.
+
+**twitterapi.io** (recommended) — unofficial third-party reseller of X's
+search index, priced per request/credit rather than a fixed monthly tier.
+
+```bash
+export TWITTERAPI_IO_KEY="..."          # from twitterapi.io's dashboard
+```
+
+Being unofficial cuts both ways: no 7-day wall and far cheaper than X Pro, but
+it can break or change shape without notice, and its terms are the reseller's,
+not X's. Worth knowing before depending on it for anything beyond personal use.
+
+**Official X API** — used automatically if `TWITTERAPI_IO_KEY` isn't set.
+**The free tier has no search access at all** (it's post-only, 100
+reads/month), so FIRSTCALLOOR cannot find mentions on it.
 
 | Tier | Cost | Endpoint | Lookback | What it means here |
 |---|---|---|---|---|
 | Free | $0 | none | — | **Search unavailable.** Use `--mock`. |
 | Basic | ~$200/mo | `/2/tweets/search/recent` | **7 days** | Works only on tokens launched in the last week. |
-| Pro | ~$5,000/mo | `/2/tweets/search/all` | 2006 → now | The tier that makes this tool work on any token. Pass `--full-archive`. |
+| Pro | ~$5,000/mo | `/2/tweets/search/all` | 2006 → now | Works on any token. Pass `--full-archive`. |
 
 Get a token at [developer.x.com](https://developer.x.com) → create a Project +
-App → **Keys and tokens** → **Bearer Token**. It is the long `AAAAAAAA...`
-string, *not* the API Key/Secret pair.
+App → **Keys and tokens** → **Bearer Token** (the long `AAAAAAAA...` string,
+*not* the API Key/Secret pair).
 
 ```bash
 export X_BEARER_TOKEN="AAAAAAAA..."     # or pass --bearer-token
 ```
 
-The 7-day limit is not a detail you can work around. On a Basic key, if the
-token launched more than a week ago, the search window is clamped and the tool
-says so loudly — because the real first call is provably outside what it can
-see, and reporting the earliest *visible* mention as "First Call" would be a
-lie.
+The 7-day limit is not a detail you can work around on Basic. If the token
+launched more than a week ago, the search window is clamped and the tool says
+so loudly — because the real first call is provably outside what it can see,
+and reporting the earliest *visible* mention as "First Call" would be a lie.
+(twitterapi.io has no such wall, which is the whole reason it's preferred.)
+
+To force a specific provider rather than auto-detect: `--provider x` or
+`--provider twitterapi` on the CLI.
+
+**A note on verification.** The twitterapi.io client is built from its
+documented response shape and unit-tested against a stub of it, but this
+project's build environment has no network path to `api.twitterapi.io`, so it
+has never been exercised against a live response. If your first real run
+returns something that fails to parse, the error names the exact field or
+timestamp that didn't match — that's a quick fix, not a rewrite.
 
 ### 2. Solana RPC — optional
 
@@ -137,8 +165,9 @@ is the only unambiguous identifier, which is also why a ticker as input is
 rejected rather than guessed at.
 
 **Finding the *earliest* mention is not the same as fetching 200 tweets.**
-X API v2 has no ascending sort. Paginating newest-first on a busy token burns
-the whole quota on late mentions and never reaches the first call. Instead:
+Neither X API v2 nor twitterapi.io offer an ascending sort. Paginating
+newest-first on a busy token burns the whole quota on late mentions and never
+reaches the first call. Instead:
 
 1. Anchor a search window at the launch timestamp.
 2. Expand it outward (1h → 6h → 24h → 72h → 7d) only until mentions appear.
@@ -164,16 +193,18 @@ output and the JSON, with the reason attached.
 ## Options
 
 ```
---mock                  synthetic mentions, no X key needed
+--mock                  synthetic mentions, no key needed
 --json PATH             where to write the result set
---full-archive          use /2/tweets/search/all (X API Pro+)
+--provider {auto,x,twitterapi}   mention provider (default: auto-detect)
+--twitterapi-key KEY    twitterapi.io key (overrides TWITTERAPI_IO_KEY)
+--bearer-token TOKEN    X bearer token (overrides X_BEARER_TOKEN)
+--full-archive          use /2/tweets/search/all (X API Pro+; no effect on twitterapi.io)
 --max-tweets N          cap on tweets fetched (default 200)
 --sig-page-cap N        max signature pages to walk (default 50 = 50k txs)
 --include-retweets      rank retweets and quote tweets as mentions
 --pre-window-hours N    hours before launch to probe for recycled CAs (0 off)
 --no-cross-check        skip the pump.fun cross-check
 --rpc URL               Solana RPC endpoint
---bearer-token TOKEN    X bearer token (overrides env)
 -v, --verbose           log pagination to stderr
 ```
 
@@ -214,9 +245,12 @@ and `search` metadata including every note about incompleteness.
 python -m unittest discover -s tests -v
 ```
 
-33 tests. The X API and pump.fun are stubbed at the HTTP layer, so the search
-strategy — window expansion, cap contraction, rate-limit cut-off, the 7-day
-clamp — is verified without network access or an API key.
+53 tests. X, twitterapi.io, and pump.fun are all stubbed at the HTTP layer, so
+the search strategy — window expansion, cap contraction, rate-limit cut-off,
+the 7-day clamp (and its absence on twitterapi.io) — is verified without
+network access or an API key. This build environment has no network path to
+`api.twitterapi.io` itself, so that stub is the only verification its client
+has had; see the note under provider setup above.
 
 ---
 
