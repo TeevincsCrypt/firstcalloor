@@ -49,6 +49,15 @@ from _engine import (  # noqa: E402
 HttpBudget.timeout = int(os.environ.get("FIRSTCALLOOR_HTTP_TIMEOUT", "6"))
 HttpBudget.retries = int(os.environ.get("FIRSTCALLOOR_HTTP_RETRIES", "1"))
 HttpBudget.max_wait = 6.0
+# A 429 specifically is never worth retrying here: a real rate-limit reset
+# runs tens of seconds, this function gets ~10s total, so a retry can't
+# possibly land inside a still-limited window - it only spends a second
+# request hammering an already-tripped limiter for a wait that was doomed
+# from the start. Skipping it also halves worst-case request volume for a
+# quiet token that trips a provider's rate limit on every search width.
+HttpBudget.retry_on_429 = os.environ.get("FIRSTCALLOOR_RETRY_ON_429", "0").lower() in (
+    "1", "true", "yes", "on"
+)
 
 # Walking a busy token's signature history is the slow part, so the web path
 # uses a tighter page cap than the CLI and says so when it trips.

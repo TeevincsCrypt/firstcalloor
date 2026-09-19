@@ -144,6 +144,83 @@ class TestTriage(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# HttpBudget.retry_on_429 - regression coverage for a second production
+# incident: even after cutting search widths from 5 to 3 and adding pacing,
+# a rate limit still recurred, because each rate-limited window was actually
+# costing TWO requests (the original attempt plus one retry) - retrying a
+# 429 within a ~10s serverless budget can never land inside a real rate
+# limit reset (typically tens of seconds), so it only doubles pressure on an
+# already-tripped limiter for a wait that was doomed from the start.
+# --------------------------------------------------------------------------
+
+class TestRetryOn429(unittest.TestCase):
+    def setUp(self):
+        self._real_urlopen = fc.urllib.request.urlopen
+        self._real_sleep = fc.time.sleep
+        self._budget_snapshot = vars(fc.HttpBudget).copy()
+        fc.time.sleep = lambda *_a, **_k: None
+
+    def tearDown(self):
+        fc.urllib.request.urlopen = self._real_urlopen
+        fc.time.sleep = self._real_sleep
+        for k, v in self._budget_snapshot.items():
+            if not k.startswith("__"):
+                setattr(fc.HttpBudget, k, v)
+
+    def _always_429(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(1)
+            raise fc.urllib.error.HTTPError(req.full_url, 429, "rate limited", {}, None)
+
+        fc.urllib.request.urlopen = fake_urlopen
+        return calls
+
+    def test_retries_once_by_default(self):
+        calls = self._always_429()
+        fc.HttpBudget.retry_on_429 = True
+        fc.HttpBudget.retries = 1
+        with self.assertRaises(fc.HttpError) as ctx:
+            fc.http_json("https://example.test")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_does_not_retry_when_disabled(self):
+        calls = self._always_429()
+        fc.HttpBudget.retry_on_429 = False
+        fc.HttpBudget.retries = 1
+        with self.assertRaises(fc.HttpError) as ctx:
+            fc.http_json("https://example.test")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_disabling_429_retry_does_not_affect_5xx_retries(self):
+        calls = self._always_429()
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(1)
+            raise fc.urllib.error.HTTPError(req.full_url, 503, "unavailable", {}, None)
+
+        fc.urllib.request.urlopen = fake_urlopen
+        fc.HttpBudget.retry_on_429 = False
+        fc.HttpBudget.retries = 1
+        with self.assertRaises(fc.HttpError):
+            fc.http_json("https://example.test")
+        self.assertEqual(len(calls), 2, "a 503 should still retry once regardless of retry_on_429")
+
+    def test_web_entrypoint_disables_retry_on_429_by_default(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "analyze_retry_check", str(Path(__file__).resolve().parents[1] / "api" / "analyze.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        os.environ.pop("FIRSTCALLOOR_RETRY_ON_429", None)
+        spec.loader.exec_module(mod)
+        self.assertFalse(fc.HttpBudget.retry_on_429)
+
+
+# --------------------------------------------------------------------------
 # X search strategy, stubbed at the HTTP layer
 # --------------------------------------------------------------------------
 

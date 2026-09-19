@@ -143,6 +143,7 @@ class HttpBudget:
     timeout = HTTP_TIMEOUT
     retries = MAX_RETRIES
     max_wait = 90.0
+    retry_on_429 = True   # web sets this False - see http_json's 429 branch
 
 
 def http_json(
@@ -181,8 +182,17 @@ def http_json(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", "replace")
             err = HttpError(exc.code, raw, url)
-            # 429 and 5xx are worth retrying; everything else is terminal.
+            # 429 and 5xx are worth retrying in general; everything else is
+            # terminal. But retrying a 429 specifically is only worth doing
+            # when HttpBudget.retry_on_429 allows it: a real rate-limit
+            # reset is typically tens of seconds, far longer than a
+            # serverless function's whole time budget, so on the web path a
+            # retry here can never plausibly land inside a still-limited
+            # window - it only burns a second request against an already-
+            # tripped limiter for a wait that was doomed before it started.
             if exc.code != 429 and exc.code < 500:
+                raise err
+            if exc.code == 429 and not HttpBudget.retry_on_429:
                 raise err
             last = err
             wait = delay
