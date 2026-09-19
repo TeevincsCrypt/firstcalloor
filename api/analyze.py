@@ -4,13 +4,26 @@ Returns the same report the CLI writes to JSON. Stdlib only - no build step,
 no requirements.txt, nothing to install.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-from _engine import (
+# Vercel's Python runtime does not guarantee this file's own directory is on
+# sys.path when it imports this module as the function entrypoint - it works
+# locally (dev_server.py puts api/ on sys.path itself) but silently fails on
+# Vercel with a bare `from _engine import ...`, crashing at import time
+# before do_GET ever runs. That produces Vercel's own generic platform error
+# page instead of anything from this file's error handling, which is exactly
+# the "Unexpected token 'A', "A server e"..." a browser sees when it tries to
+# JSON.parse that HTML. Making the import self-sufficient fixes it outright.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _engine import (  # noqa: E402
     DEFAULT_RPC,
     DEFAULT_TWEET_CAP,
     FirstCallooorError,

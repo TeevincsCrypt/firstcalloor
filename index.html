@@ -7,117 +7,344 @@
 <meta name="description" content="Find the earliest verifiable X mention of a Solana memecoin, anchored to its on-chain creation time.">
 <style>
   :root{
-    --bg:#0a0b0e; --panel:#121419; --panel-2:#171a21; --line:#242832;
-    --text:#e7e9ee; --muted:#878da0; --faint:#5c6275;
-    --accent:#2bd97c; --accent-dim:#1a8a4f; --warn:#f5b23e; --bad:#f2555a;
+    --bg:#07070a; --bg-soft:#0c0d11;
+    --panel:rgba(255,255,255,.035); --panel-solid:#111319; --panel-2:#15171e;
+    --line:rgba(255,255,255,.09); --line-soft:rgba(255,255,255,.06);
+    --text:#f3f1ee; --muted:#9d9aa6; --faint:#68656f;
+    --brand:#ff4d3d; --brand-2:#ff2d6a; --brand-dim:#7a2a22; --brand-glow:rgba(255,77,61,.5);
+    --ok:#2bd97c; --ok-dim:#1a8a4f; --warn:#f5b23e; --bad:#ff5f6d;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --radius:16px;
   }
   *{box-sizing:border-box}
+  html{background:var(--bg)}
   body{
     margin:0; background:var(--bg); color:var(--text);
-    font-family:var(--mono); font-size:15px; line-height:1.55;
-    -webkit-font-smoothing:antialiased;
+    font-family:var(--mono); font-size:15px; line-height:1.6;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
   }
-  .wrap{max-width:900px; margin:0 auto; padding:40px 16px 80px}
-  header{margin-bottom:28px}
-  h1{
-    font-size:clamp(28px,6vw,42px); margin:0; letter-spacing:-.02em; font-weight:700;
+  a{color:inherit}
+  ::selection{background:var(--brand); color:#1a0503}
+
+  /* ---------- ambient background ---------- */
+  .glow{position:fixed; inset:0; z-index:-1; pointer-events:none; overflow:hidden}
+  .glow::before, .glow::after{
+    content:""; position:absolute; border-radius:50%; filter:blur(10px);
   }
-  h1 .dot{color:var(--accent)}
-  .tag{color:var(--muted); font-size:13px; margin-top:6px}
-  form{display:flex; gap:8px; margin:26px 0 8px; flex-wrap:wrap}
+  .glow::before{
+    width:900px; height:900px; top:-420px; left:50%; transform:translateX(-38%);
+    background:radial-gradient(circle at 50% 40%, rgba(255,77,61,.35), rgba(255,45,106,.14) 45%, transparent 72%);
+  }
+  .glow::after{
+    width:640px; height:640px; top:120px; right:-260px;
+    background:radial-gradient(circle, rgba(255,77,61,.16), transparent 70%);
+  }
+  .grid-tex{
+    position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.35;
+    background-image:
+      linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+    background-size:42px 42px;
+    mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 40%, transparent 78%);
+  }
+
+  .wrap{max-width:900px; margin:0 auto; padding:0 16px 90px}
+
+  /* ---------- nav ---------- */
+  nav.top{
+    position:sticky; top:14px; z-index:20; max-width:900px; margin:14px auto 0;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:11px 10px 11px 16px; border-radius:999px;
+    background:rgba(14,15,19,.72); border:1px solid var(--line);
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+  }
+  .brandmark{display:flex; align-items:center; gap:9px; font-weight:700; letter-spacing:-.01em; font-size:14.5px}
+  .brandmark .sq{
+    width:20px; height:20px; border-radius:6px; flex:none;
+    background:linear-gradient(135deg, var(--brand), var(--brand-2));
+    box-shadow:0 0 14px var(--brand-glow);
+  }
+  nav.top .navlinks{display:flex; align-items:center; gap:4px}
+  nav.top .navlinks a{
+    font-size:12.5px; color:var(--muted); text-decoration:none; padding:7px 13px;
+    border-radius:999px; transition:color .15s, background .15s;
+  }
+  nav.top .navlinks a:hover{color:var(--text); background:rgba(255,255,255,.06)}
+  .navcta{
+    font-size:12.5px; font-weight:700; color:#1a0503; text-decoration:none;
+    background:linear-gradient(135deg, var(--brand), var(--brand-2));
+    padding:8px 16px; border-radius:999px; white-space:nowrap;
+  }
+  @media (max-width:640px){ nav.top .navlinks{display:none} }
+
+  /* ---------- hero ---------- */
+  header.hero{padding:64px 0 8px; text-align:center}
+  .badge{
+    display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted);
+    background:var(--panel); border:1px solid var(--line); padding:7px 14px 7px 11px;
+    border-radius:999px; margin-bottom:22px;
+  }
+  .badge .bdot{width:6px; height:6px; border-radius:50%; background:var(--brand); box-shadow:0 0 8px var(--brand-glow)}
+  h1.h{
+    font-size:clamp(34px,7vw,58px); line-height:1.04; margin:0; letter-spacing:-.03em; font-weight:700;
+  }
+  h1.h .grad{
+    background:linear-gradient(90deg,#fff 5%, var(--brand) 65%, var(--brand-2) 100%);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .sub{
+    max-width:520px; margin:18px auto 0; color:var(--muted); font-size:14.5px; line-height:1.65;
+  }
+
+  form{
+    display:flex; gap:8px; margin:32px auto 0; max-width:640px; flex-wrap:wrap;
+    background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:6px;
+    backdrop-filter:blur(10px);
+  }
   input[type=text]{
-    flex:1 1 320px; min-width:0; background:var(--panel); border:1px solid var(--line);
+    flex:1 1 320px; min-width:0; background:transparent; border:0;
     color:var(--text); font-family:var(--mono); font-size:14px;
-    padding:13px 14px; border-radius:8px; outline:none;
+    padding:12px 16px; border-radius:999px; outline:none;
   }
-  input[type=text]:focus{border-color:var(--accent-dim)}
+  input[type=text]::placeholder{color:var(--faint)}
   button{
-    background:var(--accent); color:#04150c; border:0; font-family:var(--mono);
-    font-weight:700; font-size:14px; padding:13px 22px; border-radius:8px; cursor:pointer;
+    background:linear-gradient(135deg, var(--brand), var(--brand-2));
+    color:#1a0503; border:0; font-family:var(--mono);
+    font-weight:700; font-size:14px; padding:12px 24px; border-radius:999px; cursor:pointer;
+    box-shadow:0 6px 24px -6px var(--brand-glow);
   }
-  button:disabled{opacity:.5; cursor:progress}
-  .hint{color:var(--faint); font-size:12.5px}
+  button:disabled{opacity:.5; cursor:progress; box-shadow:none}
+  .hint{color:var(--faint); font-size:12.5px; text-align:center; margin-top:14px}
+
+  .feats{display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:40px}
+  .feat{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:16px 16px 17px; text-align:left;
+  }
+  .feat .k{font-size:13.5px; font-weight:700; color:var(--text)}
+  .feat .v{font-size:12px; color:var(--faint); margin-top:5px; line-height:1.5}
+  @media (max-width:640px){ .feats{grid-template-columns:1fr} header.hero{padding-top:44px} }
+
+  /* ---------- result panels (shared with #out) ---------- */
+  #out{margin-top:22px}
   .panel{
-    background:var(--panel); border:1px solid var(--line); border-radius:10px;
-    padding:18px 20px; margin-top:16px;
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:20px 22px; margin-top:14px; backdrop-filter:blur(10px);
   }
   .panel h2{
     font-size:11px; letter-spacing:.14em; text-transform:uppercase;
-    color:var(--muted); margin:0 0 14px; font-weight:600;
+    color:var(--muted); margin:0 0 15px; font-weight:600;
   }
-  .kv{display:grid; grid-template-columns:130px 1fr; gap:6px 14px; font-size:13.5px}
+  .kv{display:grid; grid-template-columns:130px 1fr; gap:7px 14px; font-size:13.5px}
   .kv dt{color:var(--muted)}
   .kv dd{margin:0; word-break:break-all}
-  .ok{color:var(--accent)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
   .muted{color:var(--muted)} .faint{color:var(--faint)}
-  .hero{border-color:var(--accent-dim); background:linear-gradient(180deg,#0f1f16,var(--panel))}
-  .hero .handle{font-size:26px; font-weight:700; letter-spacing:-.01em}
-  .hero .called{color:var(--accent); font-size:17px; margin-top:4px}
-  .hero .body{margin-top:12px; color:var(--text); font-size:14px}
-  .hero a{color:var(--muted); font-size:12.5px; text-decoration:none; word-break:break-all}
-  .hero a:hover{color:var(--accent)}
+  .hero-card{
+    border-color:var(--brand-dim);
+    background:linear-gradient(165deg, rgba(255,77,61,.13), var(--panel) 55%);
+    box-shadow:0 0 0 1px rgba(255,77,61,.08) inset, 0 20px 50px -30px var(--brand-glow);
+  }
+  .hero-card .handle{font-size:27px; font-weight:700; letter-spacing:-.01em}
+  .hero-card .called{
+    display:inline-flex; align-items:center; gap:7px; color:var(--brand);
+    font-size:16.5px; margin-top:6px; font-weight:600;
+  }
+  .hero-card .body{margin-top:13px; color:var(--text); font-size:14px}
+  .hero-card a{color:var(--muted); font-size:12.5px; text-decoration:none; word-break:break-all}
+  .hero-card a:hover{color:var(--brand)}
   ol.timeline{list-style:none; margin:0; padding:0; counter-reset:r}
   ol.timeline li{
-    padding:13px 0 13px 40px; border-top:1px solid var(--line); position:relative;
+    padding:14px 0 14px 42px; border-top:1px solid var(--line-soft); position:relative;
   }
   ol.timeline li:first-child{border-top:0}
   ol.timeline li::before{
     counter-increment:r; content:counter(r);
-    position:absolute; left:0; top:13px; width:24px; height:24px; border-radius:6px;
+    position:absolute; left:0; top:14px; width:25px; height:25px; border-radius:8px;
     background:var(--panel-2); color:var(--muted); font-size:12px;
-    display:grid; place-items:center;
+    display:grid; place-items:center; border:1px solid var(--line-soft);
   }
   .row1{display:flex; gap:10px; align-items:baseline; flex-wrap:wrap}
   .row1 .h{font-weight:700}
-  .row1 .d{margin-left:auto; color:var(--accent); font-size:13px; white-space:nowrap}
-  .row2{color:var(--muted); font-size:13px; margin-top:3px}
-  .row3{margin-top:3px}
+  .row1 .d{margin-left:auto; color:var(--brand); font-size:13px; white-space:nowrap; font-weight:600}
+  .row2{color:var(--muted); font-size:13px; margin-top:4px}
+  .row3{margin-top:4px}
   .row3 a{color:var(--faint); font-size:12px; text-decoration:none; word-break:break-all}
-  .row3 a:hover{color:var(--accent)}
+  .row3 a:hover{color:var(--brand)}
   .note{
-    border-left:2px solid var(--warn); background:#1a1710; padding:10px 14px;
-    margin-top:10px; font-size:13px; color:#e3d3b4; border-radius:0 6px 6px 0;
+    border-left:2px solid var(--warn); background:rgba(245,178,62,.08); padding:11px 14px;
+    margin-top:11px; font-size:13px; color:#f0dcb4; border-radius:0 8px 8px 0;
   }
-  .note.bad{border-color:var(--bad); background:#1c1112; color:#f0cbcd}
-  .note.info{border-color:var(--accent-dim); background:#0f1a14; color:#bfe3cf}
+  .note.bad{border-color:var(--bad); background:rgba(255,95,109,.08); color:#f7d0d4}
+  .note.info{border-color:var(--brand); background:rgba(255,77,61,.08); color:#f5cfc9}
   .note code{background:#00000055; padding:1px 5px; border-radius:4px}
   .flagrow{
     display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;
-    padding:8px 0; border-top:1px solid var(--line); font-size:13px;
+    padding:9px 0; border-top:1px solid var(--line-soft); font-size:13px;
   }
   .flagrow:first-of-type{border-top:0}
   .flagrow .d{margin-left:auto; white-space:nowrap}
   .flagrow a{color:var(--faint); text-decoration:none}
-  .flagrow a:hover{color:var(--accent)}
-  pre.err{white-space:pre-wrap; margin:0; font-size:13px; color:#f0cbcd}
-  footer{margin-top:40px; color:var(--faint); font-size:12px; text-align:center}
-  footer a{color:var(--muted)}
+  .flagrow a:hover{color:var(--brand)}
+  pre.err{white-space:pre-wrap; margin:0; font-size:13px; color:#f7d0d4}
   .spin{display:inline-block; animation:b 1s steps(2) infinite}
   @keyframes b{50%{opacity:0}}
   @media (max-width:520px){ .kv{grid-template-columns:1fr} .kv dt{color:var(--faint)} }
+
+  /* ---------- marketing-ish sections below the tool ---------- */
+  section.info{margin-top:96px}
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:7px; font-size:11.5px; color:var(--muted);
+    background:var(--panel); border:1px solid var(--line); padding:6px 13px 6px 10px;
+    border-radius:999px; margin-bottom:18px;
+  }
+  .eyebrow .bdot{width:5px; height:5px; border-radius:50%; background:var(--brand)}
+  .lede{
+    font-size:clamp(19px,3.4vw,26px); line-height:1.55; letter-spacing:-.01em;
+    max-width:680px; color:var(--muted);
+  }
+  .lede b{color:var(--text); font-weight:600}
+  .lede .hl{color:var(--brand); font-weight:600}
+
+  .steps{display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-top:26px}
+  .step{
+    position:relative; background:var(--panel-solid); border:1px solid var(--line);
+    border-radius:18px; padding:22px 22px 20px;
+  }
+  .step .tag{
+    position:absolute; top:20px; right:20px; font-size:11px; color:var(--faint);
+    font-variant-numeric:tabular-nums;
+  }
+  .step h3{margin:0 0 8px; font-size:16.5px; font-weight:700; letter-spacing:-.01em; max-width:80%}
+  .step p{margin:0; color:var(--muted); font-size:13px; line-height:1.6}
+  .pills{display:flex; flex-wrap:wrap; gap:7px; margin-top:14px}
+  .pill{
+    font-size:11.5px; color:var(--muted); background:rgba(255,255,255,.05);
+    border:1px solid var(--line); padding:5px 11px; border-radius:999px;
+  }
+  @media (max-width:640px){ .steps{grid-template-columns:1fr} }
+
+  .quote{
+    margin-top:26px; background:linear-gradient(165deg, rgba(255,77,61,.09), var(--panel-solid) 60%);
+    border:1px solid var(--line); border-radius:18px; padding:28px 30px;
+  }
+  .quote .mark{font-size:34px; color:var(--brand); line-height:1; font-weight:700}
+  .quote p{margin:6px 0 0; font-size:16.5px; line-height:1.55; color:var(--text); max-width:560px}
+  .quote .cap{margin-top:14px; font-size:12.5px; color:var(--faint)}
+
+  footer.site{
+    margin-top:90px; padding-top:26px; border-top:1px solid var(--line);
+    display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between;
+    color:var(--faint); font-size:12px;
+  }
+  footer.site .flinks{display:flex; gap:16px}
+  footer.site a{color:var(--muted); text-decoration:none}
+  footer.site a:hover{color:var(--brand)}
 </style>
 </head>
 <body>
+<div class="glow"></div>
+<div class="grid-tex"></div>
+
+<nav class="top">
+  <div class="brandmark"><span class="sq"></span>FIRSTCALLOOR</div>
+  <div class="navlinks">
+    <a href="#how">How it works</a>
+    <a href="#pipeline">Pipeline</a>
+  </div>
+  <a class="navcta" href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">Source</a>
+</nav>
+
 <div class="wrap">
 
-  <header>
-    <h1>FIRSTCALLOOR<span class="dot">.</span></h1>
-    <div class="tag">Who called it first &mdash; anchored to the token's real on-chain birth, not a self-reported timestamp.</div>
-  </header>
+  <header class="hero">
+    <span class="badge"><span class="bdot"></span>On-chain verified, not self-reported</span>
+    <h1 class="h">Who called it <span class="grad">first</span>?</h1>
+    <p class="sub">Paste a Solana contract address. FIRSTCALLOOR anchors the token's real
+      on-chain birth, searches X for who mentioned it, and ranks the earliest
+      genuine call &mdash; with proof.</p>
 
-  <form id="f">
-    <input id="ca" type="text" spellcheck="false" autocomplete="off"
-           placeholder="Paste a Solana contract address (not a ticker)">
-    <button id="go" type="submit">Trace</button>
-  </form>
-  <div class="hint">Tickers are rejected on purpose &mdash; they collide, and a wrong &ldquo;first call&rdquo; is worse than none.</div>
+    <form id="f">
+      <input id="ca" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Paste a Solana contract address (not a ticker)">
+      <button id="go" type="submit">Trace</button>
+    </form>
+    <div class="hint">Tickers are rejected on purpose &mdash; they collide, and a wrong &ldquo;first call&rdquo; is worse than none.</div>
+
+    <div class="feats">
+      <div class="feat"><div class="k">On-chain zero point</div>
+        <div class="v">Genesis transaction pulled straight from Solana RPC, never trusted from an API's self-reported field.</div></div>
+      <div class="feat"><div class="k">Exact CA, never the ticker</div>
+        <div class="v">Tickers collide across dozens of tokens. Only the 44-char mint address is searched.</div></div>
+      <div class="feat"><div class="k">Bots flagged, not hidden</div>
+        <div class="v">Accounts under 24h old are surfaced separately &mdash; never silently folded into the ranking.</div></div>
+    </div>
+  </header>
 
   <div id="out"></div>
 
-  <footer>
-    on-chain zero point via Solana RPC &middot; mentions via X API v2 &middot;
-    <a href="https://github.com/TeevincsCrypt/firstcalloor">source</a>
+  <section class="info" id="how">
+    <span class="eyebrow"><span class="bdot"></span>How it works</span>
+    <p class="lede">Every timeline starts from the token's <span class="hl">real on-chain birth</span>,
+      never a third-party's self-reported timestamp. From there, FIRSTCALLOOR searches for the
+      <b>exact contract address</b> &mdash; not the ticker &mdash; and <span class="hl">filters out
+      recycled CAs, retweets, and bot accounts</span> before anyone gets ranked as first.</p>
+  </section>
+
+  <section class="info" id="pipeline">
+    <span class="eyebrow"><span class="bdot"></span>Under the hood</span>
+    <p class="lede" style="max-width:520px">Four steps, no guessing.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="tag">01</span>
+        <h3>On-chain origin</h3>
+        <p>Signature history is paginated back to the mint's genesis transaction on Solana.</p>
+        <div class="pills">
+          <span class="pill">getSignaturesForAddress</span>
+          <span class="pill">getTransaction</span>
+        </div>
+      </div>
+      <div class="step">
+        <span class="tag">02</span>
+        <h3>Provider search</h3>
+        <p>The exact CA string is searched for mentions, windowed outward from launch to control cost.</p>
+        <div class="pills">
+          <span class="pill">twitterapi.io</span>
+          <span class="pill">X API v2</span>
+        </div>
+      </div>
+      <div class="step">
+        <span class="tag">03</span>
+        <h3>Triage &amp; filtering</h3>
+        <p>Pre-launch mentions, retweets, and fresh accounts are pulled out and shown separately.</p>
+        <div class="pills">
+          <span class="pill">recycled CAs</span>
+          <span class="pill">bot accounts</span>
+        </div>
+      </div>
+      <div class="step">
+        <span class="tag">04</span>
+        <h3>Ranked timeline</h3>
+        <p>What's left is ranked earliest-first, each entry carrying a link, handle, and timestamp.</p>
+        <div class="pills">
+          <span class="pill">proof, not guesses</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="quote">
+      <div class="mark">&ldquo;</div>
+      <p>A wrong &ldquo;first call&rdquo; is worse than no call &mdash; so if it can't be verified,
+        it isn't ranked.</p>
+      <div class="cap">&mdash; FIRSTCALLOOR design principle</div>
+    </div>
+  </section>
+
+  <footer class="site">
+    <div>on-chain zero point via Solana RPC &middot; mentions via twitterapi.io / X API v2</div>
+    <div class="flinks">
+      <a href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">source</a>
+    </div>
   </footer>
 </div>
 
@@ -193,7 +420,7 @@ function renderFirstCall(d) {
       <span class="faint">&middot; ${esc(f.tweeted_at)}</span></div>
     <div class="body">${esc(f.text)}</div>
     <div style="margin-top:10px"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a></div>
-  `, "hero") + panel("Search", `
+  `, "hero-card") + panel("Search", `
     <dl class="kv">
       ${providerLabel ? `<dt>Provider</dt><dd>${esc(providerLabel)}</dd>` : ""}
       <dt>Query</dt><dd>${esc(s.query)} <span class="faint">(exact CA, never the ticker)</span></dd>

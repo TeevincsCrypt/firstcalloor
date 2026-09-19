@@ -1,6 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "cleanUrls": true,
+  "functions": {
+    "api/analyze.py": {
+      "runtime": "python3.12",
+      "maxDuration": 10
+    }
+  },
   "headers": [
     {
       "source": "/(.*)",
