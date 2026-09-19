@@ -110,6 +110,18 @@ Being unofficial cuts both ways: no 7-day wall and far cheaper than X Pro, but
 it can break or change shape without notice, and its terms are the reseller's,
 not X's. Worth knowing before depending on it for anything beyond personal use.
 
+**"Rate limit reached mid-pagination" doesn't mean your credits ran out.**
+Free/trial tiers usually cap requests-per-minute separately from the total
+credit pool, and a **quiet token** (few or no mentions yet) is the case that
+trips it — every search window comes back empty, so the tool tries
+progressively wider ones until something turns up, firing one request per
+width. It's paced and capped at 3 widths specifically to avoid this, but a
+low enough per-minute cap can still be hit. A real rate-limit reset is
+typically tens of seconds — far longer than a serverless function's entire
+~10s budget — so the honest move when it happens is to say the search was
+cut short rather than pretend to wait it out. The on-chain half is
+unaffected either way.
+
 **Official X API** — used automatically if `TWITTERAPI_IO_KEY` isn't set.
 **The free tier has no search access at all** (it's post-only, 100
 reads/month), so FIRSTCALLOOR cannot find mentions on it.

@@ -603,10 +603,23 @@ class SearchOutcome:
     provider: Optional[str] = None    # "x" | "twitterapi.io" | "mock"
 
 
-# Windows tried outward from launch until mentions appear. The first call for a
-# pump.fun token lands within minutes, so starting tight keeps quota spend low.
-EXPAND_WINDOWS_H = [1, 6, 24, 72, 168]
+# Windows tried outward from launch until mentions appear. The first call for
+# a pump.fun token lands within minutes, so starting tight keeps quota spend
+# low - but a QUIET token (few or no mentions yet) is the expensive case:
+# every width comes back empty, so the loop fires one request per width with
+# no pacing between them. Fewer, coarser widths means fewer requests for
+# exactly that case, which matters more than the probe granularity: a
+# free-tier rate limit typically resets on a scale of tens of seconds, far
+# longer than a serverless function's entire time budget, so avoiding the
+# trip in the first place is the only lever that actually works here -
+# retrying more patiently is not an option when the whole request has ~10s.
+EXPAND_WINDOWS_H = [2, 24, 168]
 MIN_WINDOW_MINUTES = 5
+# Paced gap between successive expansion/contraction requests to the same
+# provider, to avoid tripping a burst rate limit even before a token's true
+# mention volume would explain hitting one. Cheap relative to the ~10s
+# serverless budget; skipped before the very first request.
+INTER_REQUEST_PACING_S = 0.35
 
 
 class BaseMentionSearchClient:
@@ -671,11 +684,18 @@ class BaseMentionSearchClient:
         hit_cap = False
         rate_note: Optional[str] = None
 
-        # Expand outward from launch until we see something.
+        # Expand outward from launch until we see something. A quiet token
+        # (the expensive case) comes back empty on every width, meaning one
+        # request per width fired in a tight loop - paced apart so that
+        # isn't mistaken by the provider for a burst.
+        first_request = True
         for hours in EXPAND_WINDOWS_H:
             end = min(start + timedelta(hours=hours), now)
             if end <= start:
                 continue
+            if not first_request:
+                time.sleep(INTER_REQUEST_PACING_S)
+            first_request = False
             window_h = hours
             mentions, hit_cap, rate_note = self._fetch_window(
                 ca, start, end, self.cap, origin_dt
@@ -686,6 +706,7 @@ class BaseMentionSearchClient:
         # Contract back toward launch if the window overflowed our cap, so the
         # mentions we keep are the earliest rather than an arbitrary recent slice.
         while hit_cap and not rate_note and window_h * 60 > MIN_WINDOW_MINUTES:
+            time.sleep(INTER_REQUEST_PACING_S)
             window_h = window_h / 4
             end = min(start + timedelta(hours=window_h), now)
             narrower, hit_cap, rate_note = self._fetch_window(

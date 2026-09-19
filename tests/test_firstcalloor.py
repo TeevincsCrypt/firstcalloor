@@ -206,9 +206,12 @@ ORIGIN = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(microsecond=0
 class TestSearchStrategy(unittest.TestCase):
     def setUp(self):
         self._real = fc.http_json
+        self._real_sleep = fc.time.sleep
+        fc.time.sleep = lambda *_a, **_k: None  # inter-request pacing, not timing, under test
 
     def tearDown(self):
         fc.http_json = self._real
+        fc.time.sleep = self._real_sleep
 
     def _client(self, fake, **kw):
         fc.http_json = fake
@@ -327,9 +330,12 @@ class TestClampedWindowUsesTrueOrigin(unittest.TestCase):
 
     def setUp(self):
         self._real = fc.http_json
+        self._real_sleep = fc.time.sleep
+        fc.time.sleep = lambda *_a, **_k: None  # inter-request pacing, not timing, under test
 
     def tearDown(self):
         fc.http_json = self._real
+        fc.time.sleep = self._real_sleep
 
     def test_clamped_window_still_measures_from_true_origin(self):
         true_origin = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0)
@@ -445,9 +451,12 @@ class FakeTwitterAPIIO:
 class TestTwitterAPIIOStrategy(unittest.TestCase):
     def setUp(self):
         self._real = fc.http_json
+        self._real_sleep = fc.time.sleep
+        fc.time.sleep = lambda *_a, **_k: None  # inter-request pacing, not timing, under test
 
     def tearDown(self):
         fc.http_json = self._real
+        fc.time.sleep = self._real_sleep
 
     def _client(self, fake, **kw):
         fc.http_json = fake
@@ -506,6 +515,29 @@ class TestTwitterAPIIOStrategy(unittest.TestCase):
         fake = FakeTwitterAPIIO([("t1", 120, "a")])
         self._client(fake).search(VALID_CA, ORIGIN)
         self.assertEqual(fake.windows[0][0], ORIGIN)
+
+    def test_paces_between_requests_for_a_quiet_token(self):
+        # A token with zero mentions is the expensive case: every expansion
+        # width comes back empty, firing one request per width with no
+        # pacing would risk tripping a provider's burst rate limit well
+        # before its real quota is exhausted - which is exactly what
+        # happened in production. Assert the pacing actually fires between
+        # requests, not just that it's defined somewhere.
+        sleeps = []
+        fc.time.sleep = lambda s: sleeps.append(s)
+        fake = FakeTwitterAPIIO([])  # no mentions at all -> every width is tried
+        self._client(fake).search(VALID_CA, ORIGIN)
+        self.assertEqual(fake.calls, len(fc.EXPAND_WINDOWS_H))
+        self.assertEqual(len(sleeps), len(fc.EXPAND_WINDOWS_H) - 1)
+        self.assertTrue(all(s == fc.INTER_REQUEST_PACING_S for s in sleeps))
+
+    def test_no_pacing_sleep_before_the_first_request(self):
+        sleeps = []
+        fc.time.sleep = lambda s: sleeps.append(s)
+        fake = FakeTwitterAPIIO([("t1", 60, "a")])  # found immediately, one call only
+        self._client(fake).search(VALID_CA, ORIGIN)
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(sleeps, [])
 
 
 class TestTwitterAPIIOParsing(unittest.TestCase):
