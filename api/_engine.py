@@ -126,19 +126,44 @@ def squash(text: str, limit: int = 96) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
 
+class HttpBudget:
+    """Mutable, process-wide HTTP call budget, read by http_json() at CALL
+    time rather than baked into its signature at import time.
+
+    HTTP_TIMEOUT/MAX_RETRIES assume a CLI user who can afford to wait out a
+    slow endpoint or a full exponential backoff (2s -> 4s -> 8s -> 16s, up to
+    ~30s of sleeping alone). A serverless function has a hard wall clock
+    instead (10s on Vercel Hobby) - under those same defaults, a single slow
+    or rate-limited call can burn the ENTIRE function budget by itself, and
+    the platform then kills the process before this tool's own error
+    handling gets a chance to run, showing an opaque platform crash page
+    instead of a JSON error. The web entrypoint tightens these at startup;
+    the CLI never touches them and keeps the generous defaults below.
+    """
+    timeout = HTTP_TIMEOUT
+    retries = MAX_RETRIES
+    max_wait = 90.0
+
+
 def http_json(
     url: str,
     *,
     method: str = "GET",
     payload: Optional[dict] = None,
     headers: Optional[dict] = None,
-    timeout: int = HTTP_TIMEOUT,
-    retries: int = MAX_RETRIES,
+    timeout: Optional[int] = None,
+    retries: Optional[int] = None,
 ) -> Any:
     """JSON request with exponential backoff on 429/5xx and network errors.
 
     Raises HttpError for a non-retryable status, or after exhausting retries.
+    `timeout`/`retries` default to HttpBudget's current values when omitted,
+    so an explicit caller-supplied value (e.g. a deliberately short one for a
+    known-flaky endpoint) always wins over the ambient budget.
     """
+    timeout = HttpBudget.timeout if timeout is None else timeout
+    retries = HttpBudget.retries if retries is None else retries
+
     body = json.dumps(payload).encode() if payload is not None else None
     hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if body is not None:
@@ -167,14 +192,14 @@ def http_json(
             # X sends an epoch-seconds reset header on rate limit.
             reset = exc.headers.get("x-rate-limit-reset") if exc.headers else None
             if exc.code == 429 and reset and reset.isdigit():
-                wait = max(wait, min(float(reset) - time.time(), 90.0))
+                wait = max(wait, min(float(reset) - time.time(), HttpBudget.max_wait))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last = exc
             wait = delay
 
         if attempt == retries:
             break
-        time.sleep(max(wait, 1.0))
+        time.sleep(max(min(wait, HttpBudget.max_wait), 1.0))
         delay *= 2
 
     if isinstance(last, HttpError):
@@ -429,7 +454,13 @@ class CrossCheck:
 
 def cross_check_pumpfun(mint: str, onchain_unix: int) -> CrossCheck:
     try:
-        data = http_json(PUMPFUN_API.format(mint=mint), retries=1)
+        # Fixed short timeout and no retry, regardless of HttpBudget: this
+        # check is advisory only and pump.fun's public API is documented
+        # right below as frequently unreachable, so a slow or hanging
+        # attempt here should never be allowed to eat a large chunk of
+        # either a CLI user's patience or (worse) a serverless function's
+        # entire wall-clock budget for what is ultimately a nice-to-have.
+        data = http_json(PUMPFUN_API.format(mint=mint), timeout=6, retries=0)
     except HttpError as exc:
         return CrossCheck(
             status="unavailable",

@@ -27,17 +27,38 @@ from _engine import (  # noqa: E402
     DEFAULT_RPC,
     DEFAULT_TWEET_CAP,
     FirstCallooorError,
+    HttpBudget,
     VERSION,
     run_analysis,
     select_provider,
     validate_contract_address,
 )
 
-# Serverless functions have a hard wall clock (10s on Vercel Hobby, 60s on Pro).
+# Serverless functions have a hard wall clock (10s on Vercel Hobby, matching
+# vercel.json's maxDuration). _engine.http_json's defaults (30s timeout, up
+# to 4 retries with exponential backoff - up to ~30s of sleeping alone) exist
+# for the CLI, where a human can afford to wait out a slow endpoint. Under
+# those same defaults here, a single slow or rate-limited call - the public
+# Solana RPC throttling a Vercel IP, a busy signature history, twitterapi.io
+# briefly lagging - can burn the ENTIRE function budget by itself, and
+# Vercel then kills the process before any of this file's own error
+# handling gets a chance to run: the browser sees the platform's own opaque
+# crash page instead of the JSON this file always tries to return. Setting
+# this tight budget at import time (before any request is handled) is what
+# makes a bad call fail fast with a clear, in-budget JSON note instead.
+HttpBudget.timeout = int(os.environ.get("FIRSTCALLOOR_HTTP_TIMEOUT", "6"))
+HttpBudget.retries = int(os.environ.get("FIRSTCALLOOR_HTTP_RETRIES", "1"))
+HttpBudget.max_wait = 6.0
+
 # Walking a busy token's signature history is the slow part, so the web path
 # uses a tighter page cap than the CLI and says so when it trips.
 WEB_SIG_PAGE_CAP = int(os.environ.get("FIRSTCALLOOR_SIG_PAGE_CAP", "12"))
 WEB_TWEET_CAP = int(os.environ.get("FIRSTCALLOOR_MAX_TWEETS", str(DEFAULT_TWEET_CAP)))
+# The pre-launch recycled-CA probe is a nice-to-have extra request, not the
+# primary answer - it costs a full network round trip the tight budget above
+# often can't spare, so the web path skips it by default. The CLI has no
+# such constraint and keeps probing 24h back unless told otherwise.
+WEB_PRE_WINDOW_HOURS = int(os.environ.get("FIRSTCALLOOR_PRE_WINDOW_HOURS", "0"))
 
 
 def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
@@ -50,7 +71,7 @@ def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
         max_tweets=WEB_TWEET_CAP,
         sig_page_cap=WEB_SIG_PAGE_CAP,
         include_retweets=include_retweets,
-        pre_window_hours=int(os.environ.get("FIRSTCALLOOR_PRE_WINDOW_HOURS", "24")),
+        pre_window_hours=WEB_PRE_WINDOW_HOURS,
         no_cross_check=False,
         verbose=False,
         mock=False,
@@ -95,10 +116,18 @@ def analyze_request(query: dict) -> tuple[int, dict]:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        status, body = analyze_request(query)
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        # analyze_request() already catches everything from validation and
+        # run_analysis, but this outer guard is the backstop for anything
+        # else unanticipated (a bad query string, a bug in this dispatch
+        # code itself) - the one thing this handler must never do is let an
+        # exception escape and produce something other than valid JSON.
+        try:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            status, body = analyze_request(query)
+        except Exception as exc:  # noqa: BLE001 - last-resort, see above
+            status, body = 500, {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
 
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))

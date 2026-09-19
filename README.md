@@ -52,12 +52,25 @@ Then set environment variables under **Settings → Environment Variables**:
 | `X_BEARER_TOKEN` | Fallback for mentions | Used only if `TWITTERAPI_IO_KEY` is unset. |
 | `X_FULL_ARCHIVE` | Optional | `1` to use full-archive search on the official X API (Pro tier). No effect on twitterapi.io. |
 | `FIRSTCALLOOR_SIG_PAGE_CAP` | Optional | Signature pages per request, default `12`. Lower it if you hit the function timeout. |
+| `FIRSTCALLOOR_HTTP_TIMEOUT` | Optional | Per-request timeout in seconds, default `6`. The CLI uses a generous 30s; the web path needs every call to fail fast instead of eating the function's whole budget. |
+| `FIRSTCALLOOR_HTTP_RETRIES` | Optional | Retries per request, default `1`. Raise cautiously — each retry can add several seconds. |
+| `FIRSTCALLOOR_PRE_WINDOW_HOURS` | Optional | Hours probed before launch for recycled-CA mentions, default `0` on web (`24` on the CLI) — it's an extra, non-essential network round trip the tight web budget usually can't spare. |
 
 **Serverless timeouts matter here.** Walking a busy token's signature history
 back to genesis is the slow part, and Vercel Hobby caps functions at 10s. The
 web path uses a tighter page cap than the CLI and says which happened —
 `reached genesis` or `capped` — rather than silently reporting a wrong birth
 time.
+
+This also applies below the surface: every HTTP call the web path makes uses
+a short timeout and minimal retries (`FIRSTCALLOOR_HTTP_TIMEOUT`/`_RETRIES`
+above), not the CLI's generous 30s/4-retry defaults. Under those CLI
+defaults, one slow or rate-limited call — the public Solana RPC throttling a
+Vercel IP, a lagging provider — can burn the *entire* function's time budget
+by itself; Vercel then kills the process before this tool's own error
+handling runs, and the browser sees the platform's own opaque crash page
+(`Unexpected token 'A', "..."`) instead of JSON. The tightened budget makes a
+bad call fail fast with a clear, in-budget note instead.
 
 ### Project layout
 
