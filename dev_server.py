@@ -8,7 +8,7 @@ without deploying.
 import os
 import sys
 import urllib.parse
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "api"))
@@ -41,4 +41,4 @@ if __name__ == "__main__":
     print(f"FIRSTCALLOOR dev server -> http://localhost:{port}")
     if not (os.environ.get("X_BEARER_TOKEN") or os.environ.get("TWITTER_BEARER_TOKEN")):
         print("note: X_BEARER_TOKEN unset - on-chain data only, no mention search")
-    HTTPServer(("0.0.0.0", port), Router).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), Router).serve_forever()

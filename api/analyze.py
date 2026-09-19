@@ -69,6 +69,27 @@ WEB_TWEET_CAP = int(os.environ.get("FIRSTCALLOOR_MAX_TWEETS", str(DEFAULT_TWEET_
 # such constraint and keeps probing 24h back unless told otherwise.
 WEB_PRE_WINDOW_HOURS = int(os.environ.get("FIRSTCALLOOR_PRE_WINDOW_HOURS", "0"))
 
+# On-chain extras (first buyers, dev fingerprinting, rug signal) each cost
+# several more RPC round trips on top of an already-tight budget. The rug
+# signal is cheap (3 calls total) and high-value, so it stays on. First
+# buyers and the dev-wallet scan get much smaller caps than the CLI's
+# defaults - a quick, bounded check rather than the CLI's deeper one. All
+# three are individually disableable if a deployment finds it needs to.
+WEB_FIRST_BUYERS_LIMIT = int(os.environ.get("FIRSTCALLOOR_FIRST_BUYERS_LIMIT", "5"))
+WEB_FIRST_BUYERS_SCAN_CAP = int(os.environ.get("FIRSTCALLOOR_FIRST_BUYERS_SCAN_CAP", "6"))
+WEB_DEV_SCAN_CAP = int(os.environ.get("FIRSTCALLOOR_DEV_SCAN_CAP", "8"))
+WEB_DEV_SCAN_MAX_LAUNCHES = int(os.environ.get("FIRSTCALLOOR_DEV_SCAN_MAX_LAUNCHES", "2"))
+WEB_NO_FIRST_BUYERS = os.environ.get("FIRSTCALLOOR_NO_FIRST_BUYERS", "0").lower() in ("1", "true", "yes", "on")
+# Measured against a live token: resolve_origin ~1.9s, first buyers ~1.0s,
+# risk check ~0.3s, dev scan ~2.4s - dev scan is the priciest of the three
+# and the least urgent for an at-a-glance decision (rug signal + who's
+# already bought matter more immediately than "has this dev launched other
+# tokens"), so it defaults OFF on web to leave headroom for the cross-check
+# and mention search that still have to run in the same ~10s budget. The
+# CLI has no such pressure and runs it by default.
+WEB_NO_DEV_SCAN = os.environ.get("FIRSTCALLOOR_NO_DEV_SCAN", "1").lower() in ("1", "true", "yes", "on")
+WEB_NO_RISK_CHECK = os.environ.get("FIRSTCALLOOR_NO_RISK_CHECK", "0").lower() in ("1", "true", "yes", "on")
+
 
 def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
     return argparse.Namespace(
@@ -82,6 +103,13 @@ def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
         include_retweets=include_retweets,
         pre_window_hours=WEB_PRE_WINDOW_HOURS,
         no_cross_check=False,
+        no_first_buyers=WEB_NO_FIRST_BUYERS,
+        no_dev_scan=WEB_NO_DEV_SCAN,
+        no_risk_check=WEB_NO_RISK_CHECK,
+        first_buyers_limit=WEB_FIRST_BUYERS_LIMIT,
+        first_buyers_scan_cap=WEB_FIRST_BUYERS_SCAN_CAP,
+        dev_scan_cap=WEB_DEV_SCAN_CAP,
+        dev_scan_max_launches=WEB_DEV_SCAN_MAX_LAUNCHES,
         verbose=False,
         mock=False,
         json_path=None,

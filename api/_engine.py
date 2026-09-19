@@ -53,6 +53,17 @@ TIMELINE_SIZE = 10
 HTTP_TIMEOUT = 30
 MAX_RETRIES = 4
 
+# On-chain extras (first buyers, dev fingerprinting, rug signal) each cost
+# several extra getTransaction/getAccountInfo calls on top of everything
+# else this tool already does. These CLI defaults assume a human waiting at
+# a terminal, same reasoning as HTTP_TIMEOUT/MAX_RETRIES above; the web
+# entrypoint uses much smaller numbers (see api/analyze.py) to fit a
+# serverless function's hard wall clock.
+DEFAULT_FIRST_BUYERS_LIMIT = 10
+DEFAULT_FIRST_BUYERS_SCAN_CAP = 20
+DEFAULT_DEV_SCAN_SIGNATURE_CAP = 40
+DEFAULT_DEV_SCAN_MAX_LAUNCHES = 8
+
 USER_AGENT = f"firstcalloor/{VERSION}"
 
 
@@ -322,6 +333,10 @@ class OnChainOrigin:
     pages_scanned: int
     exhausted: bool                 # did we reach the true beginning of history?
     blocktime_source: str           # "getTransaction" | "getSignaturesForAddress"
+    dev_wallet: Optional[str] = None            # fee-payer of the genesis tx
+    post_genesis_batch: list = field(default_factory=list)  # raw sig batch, newest-first;
+                                                             # [-1] is genesis itself. Only
+                                                             # trustworthy when `exhausted`.
     warnings: list[str] = field(default_factory=list)
 
 
@@ -369,14 +384,17 @@ class SolanaRPC:
 
     def earliest_signature(
         self, mint: str, page_cap: int = DEFAULT_SIG_PAGE_CAP
-    ) -> tuple[Optional[dict], int, int, bool]:
+    ) -> tuple[Optional[dict], int, int, bool, list]:
         """Walk signature history backwards to the mint's first transaction.
 
         getSignaturesForAddress returns newest-first, so we page with `before`
         until a short page tells us we've hit the beginning of history. The
-        last entry of the last page is the mint's genesis transaction.
+        last entry of the last page is the mint's genesis transaction; the
+        entries before it in that same batch are the signatures immediately
+        following genesis, chronologically - reused by find_first_buyers()
+        so identifying the earliest buyers costs zero extra RPC calls.
 
-        Returns (earliest_sig_info, total_scanned, pages, exhausted).
+        Returns (earliest_sig_info, total_scanned, pages, exhausted, last_batch).
         """
         before: Optional[str] = None
         earliest: Optional[dict] = None
@@ -390,7 +408,7 @@ class SolanaRPC:
             batch = self.call("getSignaturesForAddress", params) or []
             pages += 1
             if not batch:
-                return earliest, total, pages, True
+                return earliest, total, pages, True, []
 
             total += len(batch)
             earliest = batch[-1]
@@ -406,29 +424,30 @@ class SolanaRPC:
 
             # A short page means there is nothing older left to fetch.
             if len(batch) < SIG_PAGE_SIZE:
-                return earliest, total, pages, True
+                return earliest, total, pages, True, batch
 
-        return earliest, total, pages, False
+        return earliest, total, pages, False, batch
 
-    def block_time(self, signature: str) -> Optional[int]:
-        """Authoritative block time for a signature, or None if unavailable.
+    def get_transaction(self, signature: str) -> Optional[dict]:
+        """The full parsed transaction for a signature, or None if unavailable.
 
-        Never fatal: the signature listing already carries a blockTime, so a
-        node that refuses this call costs us corroboration, not the answer.
-        Nodes reject a transaction whose version exceeds the one we advertise,
-        and they name the version they need in the error, so retry on that.
+        Never fatal: callers that only need a detail this carries (block time,
+        the fee payer, balance deltas) can fall back to a lesser source rather
+        than aborting. Nodes reject a transaction whose version exceeds the
+        one we advertise, and name the version they need in the error, so
+        retry on that rather than giving up immediately.
         """
         for max_version in (0, None):
             opts: dict[str, Any] = {"encoding": "json"}
             if max_version is not None:
                 opts["maxSupportedTransactionVersion"] = max_version
             try:
-                result = self.call("getTransaction", [signature, opts])
+                return self.call("getTransaction", [signature, opts])
             except FirstCallooorError as exc:
                 match = re.search(r"maxSupportedTransactionVersion\": (\d+)", str(exc))
                 if match:
                     try:
-                        result = self.call(
+                        return self.call(
                             "getTransaction",
                             [signature, {
                                 "encoding": "json",
@@ -439,13 +458,24 @@ class SolanaRPC:
                         continue
                 else:
                     continue
-            return (result or {}).get("blockTime")
         return None
+
+    def block_time(self, signature: str) -> Optional[int]:
+        """Authoritative block time for a signature, or None if unavailable."""
+        return (self.get_transaction(signature) or {}).get("blockTime")
+
+
+def _account_keys(tx: dict) -> list[str]:
+    """Flat list of pubkey strings from a getTransaction result's account
+    keys, tolerating both plain-string and jsonParsed {"pubkey": ...} forms.
+    """
+    keys = ((tx or {}).get("transaction") or {}).get("message", {}).get("accountKeys", [])
+    return [k if isinstance(k, str) else k.get("pubkey") for k in keys]
 
 
 def resolve_origin(rpc: SolanaRPC, mint: str, page_cap: int) -> OnChainOrigin:
     warnings: list[str] = []
-    earliest, scanned, pages, exhausted = rpc.earliest_signature(mint, page_cap)
+    earliest, scanned, pages, exhausted, last_batch = rpc.earliest_signature(mint, page_cap)
 
     if earliest is None:
         raise FirstCallooorError(
@@ -463,10 +493,16 @@ def resolve_origin(rpc: SolanaRPC, mint: str, page_cap: int) -> OnChainOrigin:
 
     signature = earliest["signature"]
 
-    # Prefer getTransaction for the authoritative block time, per the spec;
-    # fall back to the blockTime the signature listing already carried.
+    # One getTransaction call serves three purposes: authoritative block
+    # time, the dev wallet (the genesis tx's fee payer - always accountKeys[0]
+    # by Solana protocol convention, not a pump.fun-specific assumption), and
+    # the raw batch is kept on the result for find_first_buyers() to reuse
+    # without walking the signature history a second time.
     source = "getTransaction"
-    block_time = rpc.block_time(signature)
+    genesis_tx = rpc.get_transaction(signature)
+    block_time = (genesis_tx or {}).get("blockTime")
+    dev_wallet = _account_keys(genesis_tx)[0] if genesis_tx and _account_keys(genesis_tx) else None
+
     if block_time is None:
         block_time = earliest.get("blockTime")
         source = "getSignaturesForAddress"
@@ -482,6 +518,12 @@ def resolve_origin(rpc: SolanaRPC, mint: str, page_cap: int) -> OnChainOrigin:
             "available from this RPC. Try an archival endpoint (Helius free tier)."
         )
 
+    if dev_wallet is None:
+        warnings.append(
+            "Could not identify the dev wallet (genesis transaction details were "
+            "unavailable) - dev fingerprinting and first-buyer detection are skipped."
+        )
+
     return OnChainOrigin(
         mint=mint,
         created_unix=int(block_time),
@@ -491,7 +533,524 @@ def resolve_origin(rpc: SolanaRPC, mint: str, page_cap: int) -> OnChainOrigin:
         pages_scanned=pages,
         exhausted=exhausted,
         blocktime_source=source,
+        dev_wallet=dev_wallet,
+        post_genesis_batch=last_batch if exhausted else [],
         warnings=warnings,
+    )
+
+
+# --------------------------------------------------------------------------
+# first buyers - who bought right after genesis, on-chain, no guessing
+# --------------------------------------------------------------------------
+
+@dataclass
+class BuyerActivity:
+    wallet: str
+    signature: str
+    tokens_received: float
+    sol_spent: Optional[float]        # includes tx fee + any rent; an approximation
+    timestamp_unix: Optional[int]
+    timestamp_iso: Optional[str]
+    seconds_since_creation: Optional[int]
+
+    def to_dict(self) -> dict:
+        return {
+            "wallet": self.wallet,
+            "signature": self.signature,
+            "tokens_received": self.tokens_received,
+            "sol_spent_approx": self.sol_spent,
+            "timestamp": self.timestamp_iso,
+            "seconds_since_creation": self.seconds_since_creation,
+            "time_since_creation": (
+                fmt_delta(self.seconds_since_creation)
+                if self.seconds_since_creation is not None else None
+            ),
+            "explorer_url": f"https://solscan.io/tx/{self.signature}",
+            "wallet_url": f"https://solscan.io/account/{self.wallet}",
+        }
+
+
+def _token_ui_amount(balances: list, owner: str, mint: str) -> float:
+    """Sum of ui token amount a given owner holds for a given mint across a
+    preTokenBalances/postTokenBalances list. 0.0 if the owner has no entry -
+    the normal case for a wallet that didn't yet hold the token pre-trade.
+    """
+    total = 0.0
+    for b in balances or []:
+        if b.get("owner") == owner and b.get("mint") == mint:
+            amt = (b.get("uiTokenAmount") or {}).get("uiAmount")
+            if amt is not None:
+                total += float(amt)
+    return total
+
+
+def find_first_buyers(
+    rpc: SolanaRPC, origin: OnChainOrigin, limit: int = 10, scan_cap: int = 30
+) -> tuple[list[BuyerActivity], list[str]]:
+    """The earliest wallets to receive tokens after the mint's genesis.
+
+    Reuses the signature batch resolve_origin() already fetched while
+    walking to genesis - no extra getSignaturesForAddress calls. A wallet
+    counts as a buyer when its own token balance for this mint increases
+    between the transaction's pre- and post-state; the transaction's fee
+    payer (accountKeys[0], a Solana-protocol fact, not a pump.fun-specific
+    assumption) is treated as that buyer's wallet, which holds for the
+    ordinary case of someone signing their own buy.
+
+    Only reliable when resolve_origin() reached the TRUE genesis - a capped
+    walk means `post_genesis_batch` starts from an arbitrary cutoff, not the
+    real beginning, so this is skipped entirely in that case.
+    """
+    notes: list[str] = []
+    if not origin.exhausted or not origin.post_genesis_batch:
+        if not origin.exhausted:
+            notes.append(
+                "First-buyer detection skipped: the on-chain walk didn't reach true "
+                "genesis, so 'immediately after launch' can't be trusted here."
+            )
+        return [], notes
+
+    # post_genesis_batch is newest-first; [-1] is genesis. Everything before
+    # it in the same batch is, in reverse, the chronological tail right after
+    # genesis - exactly the window a first-buyer search needs.
+    candidates = list(reversed(origin.post_genesis_batch[:-1]))[:scan_cap]
+    buyers: list[BuyerActivity] = []
+    seen_wallets: set[str] = set()
+
+    for sig_info in candidates:
+        if len(buyers) >= limit:
+            break
+        sig = sig_info.get("signature")
+        if not sig:
+            continue
+        tx = rpc.get_transaction(sig)
+        if not tx:
+            continue
+        keys = _account_keys(tx)
+        if not keys:
+            continue
+        wallet = keys[0]
+        if wallet == origin.dev_wallet or wallet in seen_wallets:
+            continue  # the dev's own follow-up txs aren't "a buyer finding this"
+
+        meta = tx.get("meta") or {}
+        pre = _token_ui_amount(meta.get("preTokenBalances"), wallet, origin.mint)
+        post = _token_ui_amount(meta.get("postTokenBalances"), wallet, origin.mint)
+        received = post - pre
+        if received <= 0:
+            continue  # not a buy by this wallet - a sell, an unrelated tx, etc.
+
+        pre_bal = (meta.get("preBalances") or [None])[0]
+        post_bal = (meta.get("postBalances") or [None])[0]
+        sol_spent = round((pre_bal - post_bal) / 1e9, 6) if pre_bal is not None and post_bal is not None else None
+
+        block_time = tx.get("blockTime") or sig_info.get("blockTime")
+        seen_wallets.add(wallet)
+        buyers.append(BuyerActivity(
+            wallet=wallet,
+            signature=sig,
+            tokens_received=round(received, 6),
+            sol_spent=sol_spent,
+            timestamp_unix=block_time,
+            timestamp_iso=iso(utc_from_unix(block_time)) if block_time else None,
+            seconds_since_creation=(block_time - origin.created_unix) if block_time else None,
+        ))
+
+    if not buyers and candidates:
+        notes.append(
+            "No buys detected in the transactions immediately following genesis - "
+            "possibly all dev-wallet activity, or buys further out than the "
+            f"{scan_cap} transactions checked."
+        )
+    return buyers, notes
+
+
+# --------------------------------------------------------------------------
+# dev wallet fingerprinting - has this wallet launched other tokens?
+# --------------------------------------------------------------------------
+
+@dataclass
+class OtherLaunch:
+    mint: str
+    signature: str
+    created_unix: Optional[int]
+    created_iso: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "mint": self.mint,
+            "created_at": self.created_iso,
+            "signature": self.signature,
+            "pump_fun_url": f"https://pump.fun/coin/{self.mint}",
+        }
+
+
+@dataclass
+class DevProfile:
+    dev_wallet: Optional[str]
+    other_launches: list[OtherLaunch] = field(default_factory=list)
+    signatures_scanned: int = 0
+    scan_exhausted: bool = True   # False only if the wallet has more history than we checked
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_serial_deployer(self) -> bool:
+        return len(self.other_launches) > 0
+
+    def to_dict(self) -> dict:
+        return {
+            "dev_wallet": self.dev_wallet,
+            "wallet_url": f"https://solscan.io/account/{self.dev_wallet}" if self.dev_wallet else None,
+            "other_launches_found": len(self.other_launches),
+            "is_serial_deployer": self.is_serial_deployer,
+            "other_launches": [o.to_dict() for o in self.other_launches],
+            "signatures_scanned": self.signatures_scanned,
+            "scan_exhausted": self.scan_exhausted,
+            "notes": self.notes,
+        }
+
+
+PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+
+def find_other_launches(
+    rpc: SolanaRPC, dev_wallet: Optional[str], exclude_mint: str,
+    signature_cap: int = 40, max_launches: int = 8,
+) -> DevProfile:
+    """Other pump.fun mints this dev wallet has created, best-effort.
+
+    Deliberately bounded to the wallet's most recent `signature_cap`
+    transactions rather than a full history walk: a dev's whole lifetime
+    activity can run into the thousands of transactions, and fetching a full
+    transaction for each one to check for a mint-creation pattern is exactly
+    the kind of unbounded cost this project has repeatedly had to rein in
+    elsewhere (search pacing, RPC retry budgets). This is a quick recent-
+    activity check, explicitly reported as such - not a claim to have found
+    every token this wallet has ever launched.
+
+    Never fatal: an RPC hiccup here degrades to "couldn't check", exactly
+    like the pump.fun cross-check does, rather than taking down the whole
+    report over what is fundamentally a bonus signal.
+    """
+    if not dev_wallet:
+        return DevProfile(dev_wallet=None, notes=["No dev wallet identified for this token."])
+
+    notes: list[str] = []
+    try:
+        batch = rpc.call("getSignaturesForAddress", [dev_wallet, {"limit": signature_cap}]) or []
+    except FirstCallooorError as exc:
+        return DevProfile(
+            dev_wallet=dev_wallet, scan_exhausted=False,
+            notes=[f"Dev wallet history check failed: {squash(str(exc), 200)}"],
+        )
+    scan_exhausted = len(batch) < signature_cap
+
+    seen_mints: set[str] = set()
+    launches: list[OtherLaunch] = []
+
+    stopped_early = False
+    for sig_info in batch:
+        if len(launches) >= max_launches:
+            stopped_early = True
+            notes.append(
+                f"Stopped after finding {max_launches} other launches - the point "
+                "was made without checking the rest of this batch."
+            )
+            break
+        sig = sig_info.get("signature")
+        if not sig:
+            continue
+        tx = rpc.get_transaction(sig)
+        if not tx:
+            continue
+        keys = _account_keys(tx)
+        if PUMP_FUN_PROGRAM_ID not in keys:
+            continue
+
+        meta = tx.get("meta") or {}
+        pre_by_index = {b.get("accountIndex"): b for b in (meta.get("preTokenBalances") or [])}
+        for tb in meta.get("postTokenBalances") or []:
+            mint = tb.get("mint")
+            if not mint or mint == exclude_mint or mint in seen_mints:
+                continue
+            # A token account with no pre-existing balance entry at all is
+            # freshly initialized in this transaction - the signature of a
+            # brand new mint being created and immediately funded, not an
+            # existing token merely being bought or transferred.
+            if tb.get("accountIndex") in pre_by_index:
+                continue
+            seen_mints.add(mint)
+            bt = tx.get("blockTime") or sig_info.get("blockTime")
+            launches.append(OtherLaunch(
+                mint=mint, signature=sig, created_unix=bt,
+                created_iso=iso(utc_from_unix(bt)) if bt else None,
+            ))
+
+    if not stopped_early and not scan_exhausted:
+        notes.append(
+            f"Checked the wallet's most recent {signature_cap} transactions only - "
+            "this is a quick check, not a full history audit. Other launches may "
+            "exist further back."
+        )
+
+    return DevProfile(
+        dev_wallet=dev_wallet,
+        other_launches=sorted(launches, key=lambda o: o.created_unix or 0),
+        signatures_scanned=len(batch),
+        scan_exhausted=scan_exhausted and not stopped_early,
+        notes=notes,
+    )
+
+
+# --------------------------------------------------------------------------
+# rug signal - mint/freeze authority + holder concentration + dev history
+# --------------------------------------------------------------------------
+
+@dataclass
+class HolderInfo:
+    owner: Optional[str]
+    token_account: str
+    amount_ui: float
+    pct_of_supply: Optional[float]
+
+    def to_dict(self) -> dict:
+        return {
+            "owner": self.owner,
+            "token_account": self.token_account,
+            "amount": self.amount_ui,
+            "pct_of_supply": self.pct_of_supply,
+        }
+
+
+@dataclass
+class RiskAssessment:
+    mint_authority: Optional[str]
+    freeze_authority: Optional[str]
+    mint_authority_revoked: Optional[bool]
+    freeze_authority_revoked: Optional[bool]
+    supply_ui: Optional[float]
+    top_holders: list[HolderInfo] = field(default_factory=list)
+    top10_pct: Optional[float] = None
+    dev_other_launches: int = 0
+    verdict: str = "unknown"      # elevated_risk | some_risk_signals | no_major_red_flags | unknown
+    reasons: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "reasons": self.reasons,
+            "mint_authority_revoked": self.mint_authority_revoked,
+            "freeze_authority_revoked": self.freeze_authority_revoked,
+            "supply": self.supply_ui,
+            "top10_holder_pct": self.top10_pct,
+            "top_holders": [h.to_dict() for h in self.top_holders],
+            "dev_other_launches": self.dev_other_launches,
+            "notes": self.notes,
+            "disclaimer": (
+                "Heuristic based on limited on-chain signals only - mint/freeze "
+                "authority status and holder concentration. It does not detect "
+                "every rug pattern (coordinated dumping, social-engineered exits, "
+                "off-chain behavior) and is not financial advice."
+            ),
+        }
+
+
+TOP_HOLDER_COUNT = 10
+RISK_TOP_HOLDER_ELEVATED_PCT = 70.0
+RISK_TOP_HOLDER_CAUTION_PCT = 40.0
+RISK_SERIAL_DEPLOYER_CAUTION_COUNT = 3
+
+
+def _parsed_mint_info(rpc: SolanaRPC, mint: str) -> Optional[dict]:
+    try:
+        result = rpc.call("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+    except FirstCallooorError:
+        return None
+    value = (result or {}).get("value")
+    if not value:
+        return None
+    parsed = ((value.get("data") or {}).get("parsed") or {}).get("info")
+    return parsed
+
+
+def get_top_holders(
+    rpc: SolanaRPC, mint: str, supply_ui: Optional[float]
+) -> tuple[list[HolderInfo], Optional[str]]:
+    """Returns (holders, failure_note). An empty list with a note means the
+    check FAILED, not that concentration is somehow zero - getTokenLargest-
+    Accounts is one of the more aggressively rate-limited methods on the
+    public RPC even by that endpoint's already-strict standards, so this
+    call failing is a real, expected case to distinguish from "checked and
+    it's fine."
+    """
+    try:
+        result = rpc.call("getTokenLargestAccounts", [mint])
+    except FirstCallooorError as exc:
+        return [], f"Holder concentration check failed: {squash(str(exc), 150)}"
+    accounts = (result or {}).get("value") or []
+    if not accounts:
+        return [], None
+
+    # getTokenLargestAccounts returns TOKEN ACCOUNT addresses, not owning
+    # wallets. getMultipleAccounts resolves all of them in ONE call instead
+    # of one getAccountInfo per holder - same data, a fraction of the RPC
+    # cost, which matters a lot given how tight this project's request
+    # budgets already have to run (serverless time limit, aggressive public
+    # RPC throttling observed directly against this exact endpoint).
+    top = accounts[:TOP_HOLDER_COUNT]
+    addresses = [a.get("address") for a in top if a.get("address")]
+    owners_by_address: dict[str, str] = {}
+    if addresses:
+        try:
+            multi = rpc.call("getMultipleAccounts", [addresses, {"encoding": "jsonParsed"}])
+            for address, value in zip(addresses, (multi or {}).get("value") or []):
+                if value:
+                    owner = ((value.get("data") or {}).get("parsed") or {}).get("info", {}).get("owner")
+                    if owner:
+                        owners_by_address[address] = owner
+        except FirstCallooorError:
+            pass  # owners stay unresolved; amounts/percentages are still valid without them
+
+    holders = []
+    for acc in top:
+        address = acc.get("address")
+        ui_amount = acc.get("uiAmount")
+        pct = (ui_amount / supply_ui * 100) if ui_amount is not None and supply_ui else None
+        holders.append(HolderInfo(
+            owner=owners_by_address.get(address), token_account=address,
+            amount_ui=ui_amount or 0.0, pct_of_supply=pct,
+        ))
+    return holders, None
+
+
+def assess_risk(rpc: SolanaRPC, mint: str, dev_profile: Optional[DevProfile]) -> RiskAssessment:
+    """Best-effort rug signal from purely on-chain, protocol-level facts.
+
+    Deliberately narrow: mint/freeze authority status and SPL account
+    ownership are standard Solana Token Program fields, not pump.fun-
+    specific internals, so this doesn't carry the same "unverified against
+    a live contract" risk as, say, bonding-curve math would. It is still a
+    heuristic, not a guarantee - see the disclaimer this always carries.
+    """
+    notes: list[str] = []
+    info = _parsed_mint_info(rpc, mint)
+    if info is None:
+        return RiskAssessment(
+            mint_authority=None, freeze_authority=None,
+            mint_authority_revoked=None, freeze_authority_revoked=None,
+            supply_ui=None, verdict="unknown",
+            notes=["Could not read the mint account - risk signal unavailable."],
+        )
+
+    mint_authority = info.get("mintAuthority")
+    freeze_authority = info.get("freezeAuthority")
+    decimals = info.get("decimals", 0)
+    raw_supply = info.get("supply")
+    supply_ui = (int(raw_supply) / (10 ** decimals)) if raw_supply is not None else None
+
+    top_holders, holder_note = get_top_holders(rpc, mint, supply_ui)
+    if holder_note:
+        notes.append(holder_note)
+    top10_pct = None
+    if supply_ui and top_holders:
+        top10_pct = round(sum(h.pct_of_supply or 0 for h in top_holders), 2)
+
+    dev_launches = len(dev_profile.other_launches) if dev_profile else 0
+
+    reasons: list[str] = []
+    mint_revoked = mint_authority is None
+    freeze_revoked = freeze_authority is None
+    if not mint_revoked:
+        reasons.append(
+            "Mint authority is still active - the dev can create unlimited new "
+            "supply at any time, diluting or dumping on holders."
+        )
+    if not freeze_revoked:
+        reasons.append(
+            "Freeze authority is still active - the dev can freeze any holder's "
+            "tokens, preventing them from selling."
+        )
+    if top10_pct is not None and top10_pct > RISK_TOP_HOLDER_ELEVATED_PCT:
+        reasons.append(f"Top {TOP_HOLDER_COUNT} wallets hold {top10_pct}% of supply.")
+    elif top10_pct is not None and top10_pct > RISK_TOP_HOLDER_CAUTION_PCT:
+        reasons.append(f"Top {TOP_HOLDER_COUNT} wallets hold {top10_pct}% of supply - worth watching.")
+    if dev_launches >= RISK_SERIAL_DEPLOYER_CAUTION_COUNT:
+        reasons.append(f"Dev wallet has launched at least {dev_launches} other tokens recently.")
+    elif dev_launches > 0:
+        reasons.append(f"Dev wallet has launched {dev_launches} other token(s) recently - for context.")
+
+    if not mint_revoked or not freeze_revoked or (top10_pct is not None and top10_pct > RISK_TOP_HOLDER_ELEVATED_PCT):
+        verdict = "elevated_risk"
+    elif (top10_pct is not None and top10_pct > RISK_TOP_HOLDER_CAUTION_PCT) or dev_launches >= RISK_SERIAL_DEPLOYER_CAUTION_COUNT:
+        verdict = "some_risk_signals"
+    else:
+        verdict = "no_major_red_flags"
+
+    return RiskAssessment(
+        mint_authority=mint_authority,
+        freeze_authority=freeze_authority,
+        mint_authority_revoked=mint_revoked,
+        freeze_authority_revoked=freeze_revoked,
+        supply_ui=supply_ui,
+        top_holders=top_holders,
+        top10_pct=top10_pct,
+        dev_other_launches=dev_launches,
+        verdict=verdict,
+        reasons=reasons,
+        notes=notes,
+    )
+
+
+# --------------------------------------------------------------------------
+# migration/graduation tracker - best-effort, generic DEX-ownership signal
+# --------------------------------------------------------------------------
+
+# Well-established, long-stable AMM program IDs. Deliberately NOT including
+# any pump.fun-internal program address for the migration instruction itself
+# - that has changed before and this sandbox has no network path to pump.fun
+# to confirm the current one, so guessing it would risk a confidently wrong
+# answer. Checking top-holder ownership against long-lived, widely-documented
+# DEX programs is a strictly safer, generic proxy for "this now trades on a
+# real AMM pool" without depending on pump.fun's own internals at all.
+KNOWN_AMM_PROGRAMS = {
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM v4",
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C": "Raydium CPMM",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA": "PumpSwap",
+}
+
+
+@dataclass
+class MigrationStatus:
+    migrated: Optional[bool]     # None = couldn't determine
+    venue: Optional[str]
+    detail: str
+
+    def to_dict(self) -> dict:
+        return {"migrated": self.migrated, "venue": self.venue, "detail": self.detail}
+
+
+def check_migration(top_holders: list[HolderInfo]) -> MigrationStatus:
+    for holder in top_holders:
+        venue = KNOWN_AMM_PROGRAMS.get(holder.owner or "")
+        if venue:
+            return MigrationStatus(
+                migrated=True, venue=venue,
+                detail=(
+                    f"A top-holder account is owned by {venue} - this token likely "
+                    "trades on a real AMM pool now, not (only) the pump.fun bonding "
+                    "curve. Best-effort signal, not a guarantee: unrecognized "
+                    "programs and partial migrations aren't detected."
+                ),
+            )
+    return MigrationStatus(
+        migrated=False, venue=None,
+        detail=(
+            "No top-holder account matches a known AMM program - likely still on "
+            "the pump.fun bonding curve, or migrated to a venue this check "
+            "doesn't recognize yet."
+        ),
     )
 
 
@@ -576,6 +1135,7 @@ class Mention:
     is_quote: bool = False
     is_reply: bool = False
     flags: list[str] = field(default_factory=list)
+    matched_buyer_wallet: Optional[str] = None   # set by flag_insider_mentions()
 
     def to_dict(self) -> dict:
         return {
@@ -596,7 +1156,30 @@ class Mention:
             "is_quote": self.is_quote,
             "is_reply": self.is_reply,
             "flags": self.flags,
+            "matched_buyer_wallet": self.matched_buyer_wallet,
         }
+
+
+def flag_insider_mentions(mentions: list[Mention], buyer_wallets: list[str]) -> None:
+    """Flag a mention whose OWN TEXT contains one of the first-buy wallet
+    addresses - mutates `mentions` in place.
+
+    This is the only reliable "insider correlation" signal available: there
+    is no public, general way to link an X handle to a wallet address, so
+    anything claiming to do that beyond "the caller pasted their own wallet
+    in the tweet" would be fabricating a confidence the data doesn't support.
+    Exact, case-sensitive substring match - Solana addresses are base58 and
+    case matters, which keeps false positives essentially at zero.
+    """
+    if not buyer_wallets or not mentions:
+        return
+    wallets = [w for w in buyer_wallets if w]
+    for m in mentions:
+        for wallet in wallets:
+            if wallet in m.text:
+                m.matched_buyer_wallet = wallet
+                m.flags.append("posted_own_buy_wallet")
+                break
 
 
 @dataclass
@@ -1281,6 +1864,68 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
     for w in origin.warnings:
         print(f"  {yellow('!')} {w}")
 
+    # -- risk signal ---------------------------------------------------------
+    risk = report.get("risk")
+    if risk:
+        section("risk signal (heuristic, not financial advice)")
+        verdict_label = {
+            "elevated_risk": red("ELEVATED RISK"),
+            "some_risk_signals": yellow("some risk signals"),
+            "no_major_red_flags": green("no major red flags"),
+            "unknown": dim("unknown - couldn't gather enough data"),
+        }.get(risk["verdict"], risk["verdict"])
+        print(f"  {'Verdict':<18}{verdict_label}")
+        if risk["mint_authority_revoked"] is not None:
+            mint_line = green("revoked") if risk["mint_authority_revoked"] else red("STILL ACTIVE")
+            freeze_line = green("revoked") if risk["freeze_authority_revoked"] else red("STILL ACTIVE")
+            print(f"  {'Mint authority':<18}{mint_line}")
+            print(f"  {'Freeze authority':<18}{freeze_line}")
+        if risk["top10_holder_pct"] is not None:
+            print(f"  {'Top 10 holders':<18}{risk['top10_holder_pct']}% of supply")
+        if risk["dev_other_launches"]:
+            print(f"  {'Dev launches':<18}{risk['dev_other_launches']} other token(s) found")
+        for reason in risk["reasons"]:
+            print(f"  {yellow('!')} {reason}")
+        for note in risk["notes"]:
+            print(f"  {dim('-')} {note}")
+        print(f"  {dim(risk['disclaimer'])}")
+
+    # -- migration ------------------------------------------------------------
+    migration = report.get("migration")
+    if migration and migration.get("migrated"):
+        section("migration")
+        print(f"  {green('Migrated')} to {migration['venue']}")
+        print(f"  {dim(migration['detail'])}")
+
+    # -- first buyers --------------------------------------------------------
+    fb = report.get("first_buyers")
+    if fb:
+        wallets = fb["wallets"]
+        section(f"first buyers  ({len(wallets)} found, on-chain)")
+        if not wallets:
+            print(dim("  none detected in the transactions checked"))
+        else:
+            for i, b in enumerate(wallets, 1):
+                spent = f"~{b['sol_spent_approx']} SOL" if b["sol_spent_approx"] is not None else "? SOL"
+                print(f"  {i:<3}{b['wallet'][:20]}...  +{spent}  "
+                      f"{dim('+' + (b['time_since_creation'] or '?'))}")
+                print(dim(f"      {b['explorer_url']}"))
+        for note in fb["notes"]:
+            print(f"  {dim('-')} {note}")
+
+    # -- dev profile -----------------------------------------------------------
+    dev = report.get("dev_profile")
+    if dev and dev.get("dev_wallet"):
+        section("dev wallet")
+        print(f"  {'Wallet':<18}{dev['dev_wallet']}")
+        serial = yellow(f"{dev['other_launches_found']} other launch(es) found") if dev["is_serial_deployer"] else green("no other launches found")
+        scanned_note = f"(checked last {dev['signatures_scanned']} txs)"
+        print(f"  {'History':<18}{serial}  {dim(scanned_note)}")
+        for launch in dev["other_launches"][:5]:
+            print(f"  {dim('-')} {launch['mint'][:24]}...  {launch['created_at'] or '?'}")
+        for note in dev["notes"]:
+            print(f"  {dim('-')} {note}")
+
     # -- search ------------------------------------------------------------
     section("search")
     provider_label = {"x": "X API v2", "twitterapi.io": "twitterapi.io", "mock": "mock fixtures"}.get(
@@ -1371,6 +2016,11 @@ def build_report(
     outcome: SearchOutcome,
     triage: Triage,
     args: argparse.Namespace,
+    buyers: Optional[list[BuyerActivity]] = None,
+    buyer_notes: Optional[list[str]] = None,
+    dev_profile: Optional[DevProfile] = None,
+    risk: Optional[RiskAssessment] = None,
+    migration: Optional[MigrationStatus] = None,
 ) -> dict:
     first = triage.timeline[0] if triage.timeline else None
     return {
@@ -1419,6 +2069,13 @@ def build_report(
             "quote_tweets": [m.to_dict() for m in triage.quotes],
             "duplicates_dropped": triage.duplicates,
         },
+        "first_buyers": {
+            "wallets": [b.to_dict() for b in (buyers or [])],
+            "notes": buyer_notes or [],
+        } if buyers is not None else None,
+        "dev_profile": dev_profile.to_dict() if dev_profile else None,
+        "risk": risk.to_dict() if risk else None,
+        "migration": migration.to_dict() if migration else None,
     }
 
 
@@ -1463,6 +2120,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--pre-window-hours", type=int, default=24,
                    help="hours before launch to probe for recycled-CA mentions (0 disables)")
     p.add_argument("--no-cross-check", action="store_true", help="skip the pump.fun cross-check")
+    p.add_argument("--no-first-buyers", action="store_true", help="skip first-buy-wallet detection")
+    p.add_argument("--no-dev-scan", action="store_true",
+                   help="skip checking the dev wallet for other pump.fun launches")
+    p.add_argument("--no-risk-check", action="store_true",
+                   help="skip the mint/freeze authority + holder-concentration rug signal")
+    p.add_argument("--first-buyers-limit", type=int, default=DEFAULT_FIRST_BUYERS_LIMIT,
+                   help=f"max first-buyer wallets to report (default {DEFAULT_FIRST_BUYERS_LIMIT})")
+    p.add_argument("--first-buyers-scan-cap", type=int, default=DEFAULT_FIRST_BUYERS_SCAN_CAP,
+                   help="post-genesis transactions to check for buys "
+                        f"(default {DEFAULT_FIRST_BUYERS_SCAN_CAP})")
+    p.add_argument("--dev-scan-cap", type=int, default=DEFAULT_DEV_SCAN_SIGNATURE_CAP,
+                   help="dev wallet's recent transactions to check for other launches "
+                        f"(default {DEFAULT_DEV_SCAN_SIGNATURE_CAP})")
+    p.add_argument("--dev-scan-max-launches", type=int, default=DEFAULT_DEV_SCAN_MAX_LAUNCHES,
+                   help=f"stop dev-wallet scan after finding this many (default {DEFAULT_DEV_SCAN_MAX_LAUNCHES})")
     p.add_argument("--verbose", "-v", action="store_true", help="log pagination to stderr")
     return p.parse_args(argv)
 
@@ -1526,8 +2198,35 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     # 1. zero point, straight from the chain
     if args.verbose:
         print(f"[1/3] resolving on-chain creation time via {args.rpc}", file=sys.stderr)
-    origin = resolve_origin(SolanaRPC(args.rpc, args.verbose), ca, args.sig_page_cap)
+    rpc = SolanaRPC(args.rpc, args.verbose)
+    origin = resolve_origin(rpc, ca, args.sig_page_cap)
     origin_dt = utc_from_unix(origin.created_unix)
+
+    # 1b. on-chain extras: first buyers, dev fingerprinting, rug signal,
+    # migration status. Each degrades independently and never aborts the
+    # run - these are bonus signals on top of the actual answer, not it.
+    buyers: list[BuyerActivity] = []
+    buyer_notes: list[str] = []
+    if not getattr(args, "no_first_buyers", False):
+        buyers, buyer_notes = find_first_buyers(
+            rpc, origin,
+            limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
+            scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
+        )
+
+    dev_profile: Optional[DevProfile] = None
+    if not getattr(args, "no_dev_scan", False):
+        dev_profile = find_other_launches(
+            rpc, origin.dev_wallet, ca,
+            signature_cap=getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP),
+            max_launches=getattr(args, "dev_scan_max_launches", DEFAULT_DEV_SCAN_MAX_LAUNCHES),
+        )
+
+    risk: Optional[RiskAssessment] = None
+    migration: Optional[MigrationStatus] = None
+    if not getattr(args, "no_risk_check", False):
+        risk = assess_risk(rpc, ca, dev_profile)
+        migration = check_migration(risk.top_holders)
 
     # 2. cross-check (advisory only, never load-bearing)
     cross = (
@@ -1602,8 +2301,21 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
             else:
                 outcome = stub("error", [str(exc)], client.requests_made, endpoint)
 
+    # Insider correlation: flag any mention whose own text contains one of
+    # the first-buy wallet addresses, before triage sorts/filters mentions
+    # into their categories - the flag needs to survive into whichever
+    # bucket a match ends up in.
+    flag_insider_mentions(outcome.mentions, [b.wallet for b in buyers])
+
     triage = triage_mentions(outcome.mentions, include_retweets=args.include_retweets)
-    report = build_report(ca, origin, cross, outcome, triage, args)
+    report = build_report(
+        ca, origin, cross, outcome, triage, args,
+        buyers=buyers if not getattr(args, "no_first_buyers", False) else None,
+        buyer_notes=buyer_notes,
+        dev_profile=dev_profile,
+        risk=risk,
+        migration=migration,
+    )
     return report, triage, outcome, origin, cross
 
 

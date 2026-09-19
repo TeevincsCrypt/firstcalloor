@@ -399,7 +399,91 @@ function renderToken(d) {
   `);
 }
 
+const VERDICT_LABEL = {
+  elevated_risk: `<span class="bad">ELEVATED RISK</span>`,
+  some_risk_signals: `<span class="warn">some risk signals</span>`,
+  no_major_red_flags: `<span class="ok">no major red flags</span>`,
+  unknown: `<span class="faint">unknown &mdash; not enough data</span>`,
+};
+
+function renderRisk(d) {
+  const r = d.risk;
+  if (!r) return "";
+  const rows = [];
+  if (r.mint_authority_revoked !== null) {
+    rows.push(`<dt>Mint authority</dt><dd>${r.mint_authority_revoked
+      ? '<span class="ok">revoked</span>' : '<span class="bad">STILL ACTIVE</span>'}</dd>`);
+    rows.push(`<dt>Freeze authority</dt><dd>${r.freeze_authority_revoked
+      ? '<span class="ok">revoked</span>' : '<span class="bad">STILL ACTIVE</span>'}</dd>`);
+  }
+  if (r.top10_holder_pct !== null) {
+    rows.push(`<dt>Top 10 holders</dt><dd>${r.top10_holder_pct}% of supply</dd>`);
+  }
+  if (r.dev_other_launches) {
+    rows.push(`<dt>Dev launches</dt><dd>${r.dev_other_launches} other token(s) found</dd>`);
+  }
+  const mig = d.migration;
+  if (mig && mig.migrated) {
+    rows.push(`<dt>Migration</dt><dd><span class="ok">migrated</span> to ${esc(mig.venue)}</dd>`);
+  }
+  return panel("Risk signal", `
+    <div style="margin-bottom:12px; font-size:15px; font-weight:700">${VERDICT_LABEL[r.verdict] || esc(r.verdict)}</div>
+    ${rows.length ? `<dl class="kv">${rows.join("")}</dl>` : ""}
+    ${r.reasons.map(x => `<div class="note">${esc(x)}</div>`).join("")}
+    ${notes(r.notes)}
+    <div class="faint" style="margin-top:12px; font-size:11.5px">${esc(r.disclaimer)}</div>
+  `);
+}
+
+function renderFirstBuyers(d) {
+  const fb = d.first_buyers;
+  if (!fb) return "";
+  const wallets = fb.wallets;
+  const inner = wallets.length ? `
+    <ol class="timeline">${wallets.map(b => `
+      <li>
+        <div class="row1">
+          <span class="h">${esc(b.wallet.slice(0,4))}&hellip;${esc(b.wallet.slice(-4))}</span>
+          <span class="faint">${b.sol_spent_approx != null ? '~' + b.sol_spent_approx + ' SOL' : ''}</span>
+          <span class="d">+${esc(b.time_since_creation || '?')}</span>
+        </div>
+        <div class="row3">
+          <a href="${esc(b.wallet_url)}" target="_blank" rel="noopener">wallet</a> &middot;
+          <a href="${esc(b.explorer_url)}" target="_blank" rel="noopener">tx</a>
+        </div>
+      </li>`).join("")}</ol>`
+    : `<div class="faint">none detected in the transactions checked</div>`;
+  return panel(`First buyers (${wallets.length})`, inner + notes(fb.notes));
+}
+
+function renderDevProfile(d) {
+  const dev = d.dev_profile;
+  if (!dev || !dev.dev_wallet) return "";
+  const launches = dev.other_launches;
+  return panel("Dev wallet", `
+    <dl class="kv">
+      <dt>Wallet</dt><dd><a href="${esc(dev.wallet_url)}" target="_blank" rel="noopener">${esc(dev.dev_wallet)}</a></dd>
+      <dt>History</dt><dd>${dev.is_serial_deployer
+        ? `<span class="warn">${dev.other_launches_found} other launch(es) found</span>`
+        : '<span class="ok">no other launches found</span>'}
+        <span class="faint">(checked last ${dev.signatures_scanned} txs)</span></dd>
+    </dl>
+    ${launches.length ? `<div style="margin-top:10px">${launches.map(l => `
+      <div class="flagrow"><span>${esc(l.mint.slice(0,8))}&hellip;</span>
+        <span class="faint">${esc(l.created_at || '?')}</span>
+        <span class="d"><a href="${esc(l.pump_fun_url)}" target="_blank" rel="noopener">view</a></span>
+      </div>`).join("")}</div>` : ""}
+    ${notes(dev.notes)}
+  `);
+}
+
 const PROVIDER_LABEL = { "x": "X API v2", "twitterapi.io": "twitterapi.io", "mock": "mock fixtures" };
+
+function insiderBadge(m) {
+  return m.matched_buyer_wallet
+    ? ` <span class="bad" title="This tweet contains a wallet address that was also a first buyer">&#9888; posted own buy wallet</span>`
+    : "";
+}
 
 function renderFirstCall(d) {
   const s = d.search;
@@ -440,7 +524,7 @@ function renderTimeline(d) {
         <span class="faint">${fmtNum(m.followers_at_query_time)}</span>
         <span class="d">+${esc(m.time_since_creation)}</span>
       </div>
-      <div class="row2">${esc(m.text)}</div>
+      <div class="row2">${esc(m.text)}${insiderBadge(m)}</div>
       <div class="row3"><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.tweeted_at)} &middot; ${esc(m.url)}</a></div>
     </li>`).join("");
   return panel(`Timeline &mdash; earliest ${d.timeline.length} genuine mentions`,
@@ -493,7 +577,8 @@ async function run(ca) {
         `<pre class="err">${esc(data.message || "Unknown error")}</pre>`);
       return;
     }
-    out.innerHTML = renderToken(data) + renderFirstCall(data)
+    out.innerHTML = renderToken(data) + renderRisk(data) + renderFirstBuyers(data)
+                  + renderDevProfile(data) + renderFirstCall(data)
                   + renderTimeline(data) + renderFlagged(data);
   } catch (e) {
     out.innerHTML = panel("Request failed", `<pre class="err">${esc(e.message)}</pre>`);

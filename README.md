@@ -84,7 +84,7 @@ api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
 api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
 firstcalloor.py      CLI wrapper around that same engine
 dev_server.py        local server mirroring Vercel's routing
-tests/               53 tests, no network or API key needed
+tests/               104 tests, no network or API key needed
 ```
 
 ---
@@ -219,6 +219,68 @@ output and the JSON, with the reason attached.
 
 ---
 
+## On-chain extras
+
+Four more signals, computed purely from Solana RPC data — no dependency on
+whether the mention search ran, found anything, or has credits left.
+
+- **First buyers** — the earliest wallets to receive tokens after genesis.
+  A wallet counts as a buyer when its own token balance for the mint
+  increases between a transaction's pre- and post-state; the transaction's
+  fee payer (a Solana-protocol fact, not a pump.fun-specific assumption) is
+  treated as that buyer. Reuses the signature batch already fetched while
+  walking to genesis — zero extra `getSignaturesForAddress` calls.
+- **Dev wallet fingerprinting** — the genesis transaction's fee payer is the
+  dev wallet; its recent history is checked for other pump.fun mints it has
+  created. Deliberately bounded (a quick recent-activity check, not a full
+  audit) and reported as such — a dev's full lifetime history can run into
+  thousands of transactions, and this project has repeatedly had to rein in
+  unbounded RPC cost elsewhere (search pacing, retry budgets).
+- **Rug signal** — mint/freeze authority status plus top-10 holder
+  concentration, combined into a verdict (`elevated_risk` /
+  `some_risk_signals` / `no_major_red_flags` / `unknown`) with the
+  underlying evidence always shown, never a bare yes/no. Built entirely from
+  standard SPL Token Program fields — not pump.fun-internal contract
+  details — so it doesn't carry the "unverified against a live contract"
+  risk the liquidity/MC simulator would (see below). **Heuristic, not
+  financial advice**: it catches unrevoked mint/freeze authority and heavy
+  concentration, not coordinated dumping, social-engineered exits, or
+  anything off-chain.
+- **Migration tracker** — flags when a top holder account is owned by a
+  well-established AMM program (Raydium, PumpSwap), meaning the token likely
+  trades on a real pool now rather than only the bonding curve. Best-effort:
+  an unrecognized venue reads as "not migrated," not "confirmed still on
+  pump.fun."
+- **Insider correlation** — flags a mention whose own tweet text contains
+  one of the first-buy wallet addresses. This is the only insider signal
+  built, deliberately: there is no public, general way to link an X handle
+  to a wallet address, and claiming otherwise would fabricate a confidence
+  the data doesn't support.
+
+**Not built, on purpose:** a liquidity-depth/market-cap simulator needs
+pump.fun's exact bonding-curve account layout and constants, which this
+project's environment has no network path to verify and which pump.fun has
+changed before — a wrong-but-confident slippage number is worse than none on
+a tool people might size real trades around. A pump.fun page-injection
+browser extension is a different deliverable (manifest, content script,
+Chrome Web Store distribution) from this website, and matching pump.fun's
+live DOM isn't verifiable from here either.
+
+**Web vs. CLI defaults** — the dev-wallet scan is **off by default on the
+website** (measured ~2.4s of a already-tight ~10s serverless budget,
+generally the least urgent of the three for an at-a-glance decision) but on
+by default on the CLI, which has no such constraint:
+
+| Variable | Default (web) | Default (CLI flag) |
+|---|---|---|
+| `FIRSTCALLOOR_NO_FIRST_BUYERS` | off (runs) | `--no-first-buyers` |
+| `FIRSTCALLOOR_NO_DEV_SCAN` | **on (skipped)** | `--no-dev-scan` |
+| `FIRSTCALLOOR_NO_RISK_CHECK` | off (runs) | `--no-risk-check` |
+| `FIRSTCALLOOR_FIRST_BUYERS_LIMIT` / `_SCAN_CAP` | `5` / `6` | `--first-buyers-limit` / `--first-buyers-scan-cap` (`10` / `20`) |
+| `FIRSTCALLOOR_DEV_SCAN_CAP` / `_MAX_LAUNCHES` | `8` / `2` | `--dev-scan-cap` / `--dev-scan-max-launches` (`40` / `8`) |
+
+---
+
 ## Options
 
 ```
@@ -233,6 +295,13 @@ output and the JSON, with the reason attached.
 --include-retweets      rank retweets and quote tweets as mentions
 --pre-window-hours N    hours before launch to probe for recycled CAs (0 off)
 --no-cross-check        skip the pump.fun cross-check
+--no-first-buyers       skip first-buy-wallet detection
+--no-dev-scan           skip the dev wallet's other-launches check
+--no-risk-check         skip the mint/freeze authority + holder-concentration signal
+--first-buyers-limit N  max first-buyer wallets to report (default 10)
+--first-buyers-scan-cap N   post-genesis txs to check for buys (default 20)
+--dev-scan-cap N        dev wallet's recent txs to check (default 40)
+--dev-scan-max-launches N   stop dev scan after finding this many (default 8)
 --rpc URL               Solana RPC endpoint
 -v, --verbose           log pagination to stderr
 ```
@@ -274,19 +343,27 @@ and `search` metadata including every note about incompleteness.
 python -m unittest discover -s tests -v
 ```
 
-53 tests. X, twitterapi.io, and pump.fun are all stubbed at the HTTP layer, so
-the search strategy — window expansion, cap contraction, rate-limit cut-off,
-the 7-day clamp (and its absence on twitterapi.io) — is verified without
-network access or an API key. This build environment has no network path to
-`api.twitterapi.io` itself, so that stub is the only verification its client
-has had; see the note under provider setup above.
+104 tests. X, twitterapi.io, and pump.fun are all stubbed at the HTTP layer,
+so the search strategy — window expansion, cap contraction, rate-limit
+cut-off, the 7-day clamp (and its absence on twitterapi.io) — is verified
+without network access or an API key. The on-chain extras (first buyers, dev
+fingerprinting, rug signal, migration, insider correlation) are covered
+against a scripted RPC stub and separately verified live against real
+pump.fun mints on Solana mainnet. This build environment has no network path
+to `api.twitterapi.io` itself, so that provider's stub is the only
+verification it has had; see the note under provider setup above.
 
 ---
 
 ## Scope (v1)
 
-**In:** CA → on-chain creation timestamp → X search → filtered ranked timeline
-→ console + JSON.
+**In:** CA → on-chain creation timestamp → X search → filtered ranked
+timeline → first buyers → dev fingerprinting → rug signal → migration status
+→ insider correlation → console + JSON.
 
-**Out:** Telegram scanning, follower-weighted "market mover" scoring,
-persistence. No database — every request is computed fresh.
+**Out:** Telegram scanning, follower-weighted "market mover" scoring, a
+liquidity-depth/MC simulator (needs unverifiable pump.fun-internal
+constants — see "On-chain extras" above), a pump.fun page-injection browser
+extension (a different deliverable entirely), persistence. No database —
+every request is computed fresh, so nothing here builds a caller-reputation
+history across tokens yet.

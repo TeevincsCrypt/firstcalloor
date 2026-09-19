@@ -377,10 +377,11 @@ class TestSearchStrategy(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class FakeRPC(fc.SolanaRPC):
-    def __init__(self, pages, block_time=1789842575):
+    def __init__(self, pages, block_time=1789842575, dev_wallet="DevWa11etFakeAddress11111111111111111111"):
         super().__init__("stub://rpc")
         self.pages = pages
         self._bt = block_time
+        self._dev_wallet = dev_wallet
         self.requests = []
 
     def call(self, method, params):
@@ -388,7 +389,15 @@ class FakeRPC(fc.SolanaRPC):
         if method == "getSignaturesForAddress":
             return self.pages.pop(0) if self.pages else []
         if method == "getTransaction":
-            return {"blockTime": self._bt}
+            if self._bt is None:
+                return {}
+            keys = [self._dev_wallet, "So11111111111111111111111111111111111111112"]
+            return {
+                "blockTime": self._bt,
+                "transaction": {"message": {"accountKeys": keys}},
+                "meta": {"preBalances": [10_000_000_000, 0], "postBalances": [9_000_000_000, 0],
+                         "preTokenBalances": [], "postTokenBalances": []},
+            }
         return None
 
 
@@ -839,6 +848,430 @@ class TestCrossCheck(unittest.TestCase):
             raise fc.HttpError(403, "cloudflare", url)
         fc.http_json = boom
         self.assertEqual(fc.cross_check_pumpfun(VALID_CA, 1789842575).status, "unavailable")
+
+
+# --------------------------------------------------------------------------
+# on-chain extras: first buyers, dev fingerprinting, rug signal, migration
+#
+# A flexible scripted RPC stub, since these functions each need much richer
+# per-call responses (full transactions with account keys and balances) than
+# the simple FakeRPC above provides.
+# --------------------------------------------------------------------------
+
+class ScriptedRPC(fc.SolanaRPC):
+    def __init__(self, responses: dict):
+        super().__init__("stub://rpc")
+        self.responses = responses   # method -> value, or method -> callable(params)
+        self.calls: list[tuple] = []
+
+    def call(self, method, params):
+        self.calls.append((method, params))
+        handler = self.responses.get(method)
+        if handler is None:
+            return None
+        return handler(params) if callable(handler) else handler
+
+
+def make_tx(fee_payer, mint, *, pre_amt=None, post_amt=None,
+            pre_sol=5_000_000_000, post_sol=4_000_000_000, block_time=1000,
+            other_keys=("OtherKey1",), extra_program_keys=()):
+    balances_pre = []
+    balances_post = []
+    if pre_amt is not None:
+        balances_pre.append({"accountIndex": 0, "owner": fee_payer, "mint": mint,
+                              "uiTokenAmount": {"uiAmount": pre_amt}})
+    if post_amt is not None:
+        balances_post.append({"accountIndex": 0, "owner": fee_payer, "mint": mint,
+                               "uiTokenAmount": {"uiAmount": post_amt}})
+    return {
+        "blockTime": block_time,
+        "transaction": {"message": {"accountKeys": [fee_payer, *other_keys, *extra_program_keys]}},
+        "meta": {
+            "preBalances": [pre_sol, 0],
+            "postBalances": [post_sol, 0],
+            "preTokenBalances": balances_pre,
+            "postTokenBalances": balances_post,
+        },
+    }
+
+
+def make_origin(dev_wallet="DevWallet1", mint=VALID_CA, created_unix=1000,
+                 exhausted=True, post_genesis_batch=None):
+    return fc.OnChainOrigin(
+        mint=mint, created_unix=created_unix, created_iso=fc.iso(fc.utc_from_unix(created_unix)),
+        genesis_signature="genesis_sig", signatures_scanned=len(post_genesis_batch or []),
+        pages_scanned=1, exhausted=exhausted, blocktime_source="getTransaction",
+        dev_wallet=dev_wallet, post_genesis_batch=post_genesis_batch or [],
+    )
+
+
+class TestFindFirstBuyers(unittest.TestCase):
+    def test_detects_a_buy(self):
+        batch = [
+            {"signature": "buy1", "blockTime": 1010},
+            {"signature": "genesis_sig", "blockTime": 1000},
+        ]
+        origin = make_origin(post_genesis_batch=batch)
+        txs = {"buy1": make_tx("Buyer1", VALID_CA, pre_amt=None, post_amt=500.0, block_time=1010)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, notes = fc.find_first_buyers(rpc, origin, limit=10, scan_cap=10)
+        self.assertEqual(len(buyers), 1)
+        self.assertEqual(buyers[0].wallet, "Buyer1")
+        self.assertEqual(buyers[0].tokens_received, 500.0)
+        self.assertEqual(buyers[0].seconds_since_creation, 10)
+
+    def test_skips_the_dev_wallets_own_transactions(self):
+        batch = [
+            {"signature": "dev_followup", "blockTime": 1005},
+            {"signature": "genesis_sig", "blockTime": 1000},
+        ]
+        origin = make_origin(dev_wallet="DevWallet1", post_genesis_batch=batch)
+        txs = {"dev_followup": make_tx("DevWallet1", VALID_CA, pre_amt=None, post_amt=999.0)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, _ = fc.find_first_buyers(rpc, origin)
+        self.assertEqual(buyers, [])
+
+    def test_skips_non_buy_transactions(self):
+        batch = [
+            {"signature": "a_sell", "blockTime": 1005},
+            {"signature": "genesis_sig", "blockTime": 1000},
+        ]
+        origin = make_origin(post_genesis_batch=batch)
+        # post <= pre: a sell or an unrelated transaction, not a buy.
+        txs = {"a_sell": make_tx("Seller1", VALID_CA, pre_amt=500.0, post_amt=200.0)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, notes = fc.find_first_buyers(rpc, origin)
+        self.assertEqual(buyers, [])
+        self.assertTrue(notes)
+
+    def test_respects_limit(self):
+        batch = [{"signature": f"buy{i}", "blockTime": 1000 + i} for i in range(5, 0, -1)]
+        batch.append({"signature": "genesis_sig", "blockTime": 1000})
+        origin = make_origin(post_genesis_batch=batch)
+        txs = {f"buy{i}": make_tx(f"Buyer{i}", VALID_CA, pre_amt=None, post_amt=100.0)
+               for i in range(1, 6)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, _ = fc.find_first_buyers(rpc, origin, limit=2, scan_cap=10)
+        self.assertEqual(len(buyers), 2)
+
+    def test_respects_scan_cap_even_with_more_candidates(self):
+        batch = [{"signature": f"buy{i}", "blockTime": 1000 + i} for i in range(10, 0, -1)]
+        batch.append({"signature": "genesis_sig", "blockTime": 1000})
+        origin = make_origin(post_genesis_batch=batch)
+        txs = {f"buy{i}": make_tx(f"Buyer{i}", VALID_CA, pre_amt=None, post_amt=100.0)
+               for i in range(1, 11)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, _ = fc.find_first_buyers(rpc, origin, limit=100, scan_cap=3)
+        self.assertEqual(len(buyers), 3)
+
+    def test_dedupes_the_same_wallet(self):
+        batch = [
+            {"signature": "buy2", "blockTime": 1020},
+            {"signature": "buy1", "blockTime": 1010},
+            {"signature": "genesis_sig", "blockTime": 1000},
+        ]
+        origin = make_origin(post_genesis_batch=batch)
+        txs = {
+            "buy1": make_tx("SameWallet", VALID_CA, pre_amt=None, post_amt=100.0, block_time=1010),
+            "buy2": make_tx("SameWallet", VALID_CA, pre_amt=100.0, post_amt=200.0, block_time=1020),
+        }
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+
+        buyers, _ = fc.find_first_buyers(rpc, origin)
+        self.assertEqual(len(buyers), 1)
+
+    def test_skipped_when_walk_did_not_reach_true_genesis(self):
+        origin = make_origin(exhausted=False, post_genesis_batch=[{"signature": "x"}])
+        buyers, notes = fc.find_first_buyers(ScriptedRPC({}), origin)
+        self.assertEqual(buyers, [])
+        self.assertTrue(any("genesis" in n.lower() for n in notes))
+
+    def test_empty_batch_is_handled_without_crashing(self):
+        origin = make_origin(exhausted=True, post_genesis_batch=[])
+        buyers, notes = fc.find_first_buyers(ScriptedRPC({}), origin)
+        self.assertEqual(buyers, [])
+
+
+class TestFindOtherLaunches(unittest.TestCase):
+    def test_finds_a_pump_fun_created_mint(self):
+        sigs_batch = [{"signature": "create1", "blockTime": 500}]
+        tx = make_tx("Dev1", "OldMint", pre_amt=None, post_amt=None, block_time=500,
+                     extra_program_keys=(fc.PUMP_FUN_PROGRAM_ID,))
+        tx["meta"]["postTokenBalances"] = [
+            {"accountIndex": 3, "owner": "Dev1", "mint": "NewMint111", "uiTokenAmount": {"uiAmount": 1.0}}
+        ]
+        rpc = ScriptedRPC({
+            "getSignaturesForAddress": lambda p: sigs_batch,
+            "getTransaction": lambda p: tx if p[0] == "create1" else None,
+        })
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="CurrentMint", signature_cap=40)
+        self.assertEqual(len(profile.other_launches), 1)
+        self.assertEqual(profile.other_launches[0].mint, "NewMint111")
+        self.assertTrue(profile.is_serial_deployer)
+
+    def test_ignores_transactions_without_the_pump_program(self):
+        sigs_batch = [{"signature": "unrelated1", "blockTime": 500}]
+        tx = make_tx("Dev1", "X", block_time=500)  # no PUMP_FUN_PROGRAM_ID in keys
+        tx["meta"]["postTokenBalances"] = [
+            {"accountIndex": 3, "owner": "Dev1", "mint": "SomeMint", "uiTokenAmount": {"uiAmount": 1.0}}
+        ]
+        rpc = ScriptedRPC({
+            "getSignaturesForAddress": lambda p: sigs_batch,
+            "getTransaction": lambda p: tx,
+        })
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="CurrentMint")
+        self.assertEqual(profile.other_launches, [])
+
+    def test_ignores_the_excluded_mint(self):
+        sigs_batch = [{"signature": "create1", "blockTime": 500}]
+        tx = make_tx("Dev1", "X", block_time=500, extra_program_keys=(fc.PUMP_FUN_PROGRAM_ID,))
+        tx["meta"]["postTokenBalances"] = [
+            {"accountIndex": 3, "owner": "Dev1", "mint": "CurrentMint", "uiTokenAmount": {"uiAmount": 1.0}}
+        ]
+        rpc = ScriptedRPC({
+            "getSignaturesForAddress": lambda p: sigs_batch,
+            "getTransaction": lambda p: tx,
+        })
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="CurrentMint")
+        self.assertEqual(profile.other_launches, [])
+
+    def test_ignores_an_existing_token_that_already_had_a_balance(self):
+        sigs_batch = [{"signature": "buy1", "blockTime": 500}]
+        tx = make_tx("Dev1", "X", block_time=500, extra_program_keys=(fc.PUMP_FUN_PROGRAM_ID,))
+        # accountIndex 3 already had a pre-balance - not a fresh mint creation.
+        tx["meta"]["preTokenBalances"] = [
+            {"accountIndex": 3, "owner": "Dev1", "mint": "OldMint", "uiTokenAmount": {"uiAmount": 5.0}}
+        ]
+        tx["meta"]["postTokenBalances"] = [
+            {"accountIndex": 3, "owner": "Dev1", "mint": "OldMint", "uiTokenAmount": {"uiAmount": 10.0}}
+        ]
+        rpc = ScriptedRPC({
+            "getSignaturesForAddress": lambda p: sigs_batch,
+            "getTransaction": lambda p: tx,
+        })
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="CurrentMint")
+        self.assertEqual(profile.other_launches, [])
+
+    def test_stops_early_once_max_launches_found(self):
+        sigs_batch = [{"signature": f"create{i}", "blockTime": 500 + i} for i in range(10)]
+        txs = {}
+        for i in range(10):
+            tx = make_tx("Dev1", "X", block_time=500 + i, extra_program_keys=(fc.PUMP_FUN_PROGRAM_ID,))
+            tx["meta"]["postTokenBalances"] = [
+                {"accountIndex": 3, "owner": "Dev1", "mint": f"Mint{i}", "uiTokenAmount": {"uiAmount": 1.0}}
+            ]
+            txs[f"create{i}"] = tx
+        rpc = ScriptedRPC({
+            "getSignaturesForAddress": lambda p: sigs_batch,
+            "getTransaction": lambda p: txs.get(p[0]),
+        })
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="CurrentMint",
+                                          signature_cap=10, max_launches=3)
+        self.assertEqual(len(profile.other_launches), 3)
+        self.assertFalse(profile.scan_exhausted)
+        self.assertTrue(any("stopped after finding" in n.lower() for n in profile.notes))
+
+    def test_no_dev_wallet_returns_empty_profile(self):
+        profile = fc.find_other_launches(ScriptedRPC({}), None, exclude_mint="X")
+        self.assertIsNone(profile.dev_wallet)
+        self.assertEqual(profile.other_launches, [])
+        self.assertTrue(profile.notes)
+
+    def test_rpc_failure_degrades_gracefully(self):
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+        rpc = ScriptedRPC({"getSignaturesForAddress": boom})
+        profile = fc.find_other_launches(rpc, "Dev1", exclude_mint="X")
+        self.assertEqual(profile.other_launches, [])
+        self.assertTrue(profile.notes)
+
+
+class TestAssessRisk(unittest.TestCase):
+    def _mint_info_response(self, mint_authority, freeze_authority, supply="1000000000000000", decimals=6):
+        return {"value": {"data": {"parsed": {"info": {
+            "mintAuthority": mint_authority, "freezeAuthority": freeze_authority,
+            "supply": supply, "decimals": decimals,
+        }}}}}
+
+    def test_mint_info_unavailable_is_unknown_verdict(self):
+        rpc = ScriptedRPC({"getAccountInfo": lambda p: None})
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "unknown")
+
+    def test_active_mint_authority_is_elevated_risk(self):
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response("SomeDevWallet", None),
+            "getTokenLargestAccounts": lambda p: {"value": []},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "elevated_risk")
+        self.assertFalse(risk.mint_authority_revoked)
+        self.assertTrue(any("mint authority" in r.lower() for r in risk.reasons))
+
+    def test_active_freeze_authority_is_elevated_risk(self):
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, "SomeDevWallet"),
+            "getTokenLargestAccounts": lambda p: {"value": []},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "elevated_risk")
+        self.assertFalse(risk.freeze_authority_revoked)
+
+    def test_revoked_authorities_and_low_concentration_is_clean(self):
+        holders = [{"address": f"acc{i}", "uiAmount": 1000.0} for i in range(3)]
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000000"),
+            "getTokenLargestAccounts": lambda p: {"value": holders},
+            "getMultipleAccounts": lambda p: {"value": [None] * len(holders)},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "no_major_red_flags")
+        self.assertTrue(risk.mint_authority_revoked)
+        self.assertTrue(risk.freeze_authority_revoked)
+
+    def test_high_concentration_is_elevated_risk(self):
+        # supply is 1_000_000 ui; one holder alone has 800_000 (80%).
+        holders = [{"address": "whale", "uiAmount": 800_000.0}]
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000", decimals=6),
+            "getTokenLargestAccounts": lambda p: {"value": holders},
+            "getMultipleAccounts": lambda p: {"value": [None]},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "elevated_risk")
+        self.assertGreater(risk.top10_pct, 70)
+
+    def test_moderate_concentration_is_some_risk_signals(self):
+        holders = [{"address": "big", "uiAmount": 500_000.0}]
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000", decimals=6),
+            "getTokenLargestAccounts": lambda p: {"value": holders},
+            "getMultipleAccounts": lambda p: {"value": [None]},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertEqual(risk.verdict, "some_risk_signals")
+
+    def test_serial_deployer_bumps_verdict_even_with_clean_mint(self):
+        dev_profile = fc.DevProfile(
+            dev_wallet="Dev1",
+            other_launches=[fc.OtherLaunch(mint=f"M{i}", signature=f"s{i}",
+                                             created_unix=1, created_iso="x") for i in range(3)],
+        )
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000000"),
+            "getTokenLargestAccounts": lambda p: {"value": []},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, dev_profile)
+        self.assertEqual(risk.verdict, "some_risk_signals")
+        self.assertEqual(risk.dev_other_launches, 3)
+
+    def test_holder_lookup_failure_notes_but_does_not_crash(self):
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+        rpc = ScriptedRPC({
+            "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000000"),
+            "getTokenLargestAccounts": boom,
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, None)
+        self.assertIsNone(risk.top10_pct)
+        self.assertTrue(any("concentration" in n.lower() for n in risk.notes))
+        # authorities were both revoked and nothing else flags - still clean
+        # despite not knowing concentration, since we distinguish "unknown"
+        # from "checked and bad".
+        self.assertEqual(risk.verdict, "no_major_red_flags")
+
+
+class TestGetTopHolders(unittest.TestCase):
+    def test_uses_one_batched_call_not_one_per_holder(self):
+        holders = [{"address": f"acc{i}", "uiAmount": 10.0} for i in range(5)]
+        rpc = ScriptedRPC({
+            "getTokenLargestAccounts": lambda p: {"value": holders},
+            "getMultipleAccounts": lambda p: {
+                "value": [{"data": {"parsed": {"info": {"owner": f"owner{i}"}}}} for i in range(5)]
+            },
+        })
+        result, note = fc.get_top_holders(rpc, VALID_CA, supply_ui=100.0)
+        self.assertIsNone(note)
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result[0].owner, "owner0")
+        self.assertEqual(result[0].pct_of_supply, 10.0)
+        methods_called = [c[0] for c in rpc.calls]
+        self.assertEqual(methods_called.count("getMultipleAccounts"), 1)
+        self.assertEqual(methods_called.count("getAccountInfo"), 0)
+
+    def test_largest_accounts_failure_returns_note(self):
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+        rpc = ScriptedRPC({"getTokenLargestAccounts": boom})
+        result, note = fc.get_top_holders(rpc, VALID_CA, supply_ui=100.0)
+        self.assertEqual(result, [])
+        self.assertIsNotNone(note)
+
+    def test_owner_resolution_failure_keeps_amounts(self):
+        holders = [{"address": "acc1", "uiAmount": 42.0}]
+
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+
+        rpc = ScriptedRPC({
+            "getTokenLargestAccounts": lambda p: {"value": holders},
+            "getMultipleAccounts": boom,
+        })
+        result, note = fc.get_top_holders(rpc, VALID_CA, supply_ui=100.0)
+        self.assertIsNone(note)
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0].owner)
+        self.assertEqual(result[0].amount_ui, 42.0)
+
+
+class TestCheckMigration(unittest.TestCase):
+    def test_detects_a_known_amm_owner(self):
+        holders = [
+            fc.HolderInfo(owner="SomeWallet", token_account="a", amount_ui=1.0, pct_of_supply=1.0),
+            fc.HolderInfo(owner="675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+                          token_account="b", amount_ui=99.0, pct_of_supply=99.0),
+        ]
+        status = fc.check_migration(holders)
+        self.assertTrue(status.migrated)
+        self.assertEqual(status.venue, "Raydium AMM v4")
+
+    def test_no_known_amm_owner_is_not_migrated(self):
+        holders = [fc.HolderInfo(owner="RandomWallet", token_account="a", amount_ui=1.0, pct_of_supply=1.0)]
+        status = fc.check_migration(holders)
+        self.assertFalse(status.migrated)
+        self.assertIsNone(status.venue)
+
+    def test_empty_holders_is_not_migrated(self):
+        status = fc.check_migration([])
+        self.assertFalse(status.migrated)
+
+
+class TestInsiderCorrelation(unittest.TestCase):
+    def test_flags_mention_containing_a_buyer_wallet(self):
+        m = mention("caller1", 10)
+        m.text = f"just aped {m.text} wallet ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci proof"
+        fc.flag_insider_mentions([m], ["ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci"])
+        self.assertEqual(m.matched_buyer_wallet, "ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci")
+        self.assertIn("posted_own_buy_wallet", m.flags)
+
+    def test_does_not_flag_unrelated_text(self):
+        m = mention("caller1", 10)
+        fc.flag_insider_mentions([m], ["SomeOtherWalletAddress11111111111111111111"])
+        self.assertIsNone(m.matched_buyer_wallet)
+        self.assertNotIn("posted_own_buy_wallet", m.flags)
+
+    def test_handles_empty_wallet_list(self):
+        m = mention("caller1", 10)
+        fc.flag_insider_mentions([m], [])
+        self.assertIsNone(m.matched_buyer_wallet)
+
+    def test_handles_empty_mentions_list(self):
+        fc.flag_insider_mentions([], ["SomeWallet"])  # must not raise
 
 
 if __name__ == "__main__":
