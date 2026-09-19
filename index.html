@@ -439,7 +439,12 @@ function renderFirstBuyers(d) {
   const fb = d.first_buyers;
   if (!fb) return "";
   const wallets = fb.wallets;
-  const inner = wallets.length ? `
+  let inner;
+  if (fb.skipped) {
+    inner = `<div class="warn">Detection did not run.</div>
+              <div class="faint">See the note below; this is not the same as checking and finding none.</div>`;
+  } else if (wallets.length) {
+    inner = `
     <ol class="timeline">${wallets.map(b => `
       <li>
         <div class="row1">
@@ -451,8 +456,10 @@ function renderFirstBuyers(d) {
           <a href="${esc(b.wallet_url)}" target="_blank" rel="noopener">wallet</a> &middot;
           <a href="${esc(b.explorer_url)}" target="_blank" rel="noopener">tx</a>
         </div>
-      </li>`).join("")}</ol>`
-    : `<div class="faint">none detected in the transactions checked</div>`;
+      </li>`).join("")}</ol>`;
+  } else {
+    inner = `<div class="faint">none detected in the transactions checked</div>`;
+  }
   return panel(`First buyers (${wallets.length})`, inner + notes(fb.notes));
 }
 

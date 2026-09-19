@@ -586,7 +586,7 @@ def _token_ui_amount(balances: list, owner: str, mint: str) -> float:
 
 def find_first_buyers(
     rpc: SolanaRPC, origin: OnChainOrigin, limit: int = 10, scan_cap: int = 30
-) -> tuple[list[BuyerActivity], list[str]]:
+) -> tuple[list[BuyerActivity], list[str], bool]:
     """The earliest wallets to receive tokens after the mint's genesis.
 
     Reuses the signature batch resolve_origin() already fetched while
@@ -600,6 +600,12 @@ def find_first_buyers(
     Only reliable when resolve_origin() reached the TRUE genesis - a capped
     walk means `post_genesis_batch` starts from an arbitrary cutoff, not the
     real beginning, so this is skipped entirely in that case.
+
+    Returns (buyers, notes, skipped). `skipped=True` means detection never
+    ran at all - the caller must not present an empty `buyers` list the same
+    way it would present "we checked and found nothing", the same distinction
+    this tool already draws between "search did not run" and "no mentions
+    found" for the mention search.
     """
     notes: list[str] = []
     if not origin.exhausted or not origin.post_genesis_batch:
@@ -608,7 +614,7 @@ def find_first_buyers(
                 "First-buyer detection skipped: the on-chain walk didn't reach true "
                 "genesis, so 'immediately after launch' can't be trusted here."
             )
-        return [], notes
+        return [], notes, True
 
     # post_genesis_batch is newest-first; [-1] is genesis. Everything before
     # it in the same batch is, in reverse, the chronological tail right after
@@ -662,7 +668,7 @@ def find_first_buyers(
             "possibly all dev-wallet activity, or buys further out than the "
             f"{scan_cap} transactions checked."
         )
-    return buyers, notes
+    return buyers, notes, False
 
 
 # --------------------------------------------------------------------------
@@ -1902,7 +1908,9 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
     if fb:
         wallets = fb["wallets"]
         section(f"first buyers  ({len(wallets)} found, on-chain)")
-        if not wallets:
+        if fb.get("skipped"):
+            print(yellow("  Detection did not run - see note below."))
+        elif not wallets:
             print(dim("  none detected in the transactions checked"))
         else:
             for i, b in enumerate(wallets, 1):
@@ -2018,6 +2026,7 @@ def build_report(
     args: argparse.Namespace,
     buyers: Optional[list[BuyerActivity]] = None,
     buyer_notes: Optional[list[str]] = None,
+    buyers_skipped: bool = False,
     dev_profile: Optional[DevProfile] = None,
     risk: Optional[RiskAssessment] = None,
     migration: Optional[MigrationStatus] = None,
@@ -2072,6 +2081,7 @@ def build_report(
         "first_buyers": {
             "wallets": [b.to_dict() for b in (buyers or [])],
             "notes": buyer_notes or [],
+            "skipped": buyers_skipped,
         } if buyers is not None else None,
         "dev_profile": dev_profile.to_dict() if dev_profile else None,
         "risk": risk.to_dict() if risk else None,
@@ -2207,8 +2217,9 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     # run - these are bonus signals on top of the actual answer, not it.
     buyers: list[BuyerActivity] = []
     buyer_notes: list[str] = []
+    buyers_skipped = True
     if not getattr(args, "no_first_buyers", False):
-        buyers, buyer_notes = find_first_buyers(
+        buyers, buyer_notes, buyers_skipped = find_first_buyers(
             rpc, origin,
             limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
             scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
@@ -2312,6 +2323,7 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
         ca, origin, cross, outcome, triage, args,
         buyers=buyers if not getattr(args, "no_first_buyers", False) else None,
         buyer_notes=buyer_notes,
+        buyers_skipped=buyers_skipped,
         dev_profile=dev_profile,
         risk=risk,
         migration=migration,

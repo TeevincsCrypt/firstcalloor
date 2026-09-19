@@ -915,7 +915,7 @@ class TestFindFirstBuyers(unittest.TestCase):
         txs = {"buy1": make_tx("Buyer1", VALID_CA, pre_amt=None, post_amt=500.0, block_time=1010)}
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, notes = fc.find_first_buyers(rpc, origin, limit=10, scan_cap=10)
+        buyers, notes, skipped = fc.find_first_buyers(rpc, origin, limit=10, scan_cap=10)
         self.assertEqual(len(buyers), 1)
         self.assertEqual(buyers[0].wallet, "Buyer1")
         self.assertEqual(buyers[0].tokens_received, 500.0)
@@ -930,7 +930,7 @@ class TestFindFirstBuyers(unittest.TestCase):
         txs = {"dev_followup": make_tx("DevWallet1", VALID_CA, pre_amt=None, post_amt=999.0)}
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, _ = fc.find_first_buyers(rpc, origin)
+        buyers, _, _ = fc.find_first_buyers(rpc, origin)
         self.assertEqual(buyers, [])
 
     def test_skips_non_buy_transactions(self):
@@ -943,9 +943,10 @@ class TestFindFirstBuyers(unittest.TestCase):
         txs = {"a_sell": make_tx("Seller1", VALID_CA, pre_amt=500.0, post_amt=200.0)}
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, notes = fc.find_first_buyers(rpc, origin)
+        buyers, notes, skipped = fc.find_first_buyers(rpc, origin)
         self.assertEqual(buyers, [])
         self.assertTrue(notes)
+        self.assertFalse(skipped)
 
     def test_respects_limit(self):
         batch = [{"signature": f"buy{i}", "blockTime": 1000 + i} for i in range(5, 0, -1)]
@@ -955,7 +956,7 @@ class TestFindFirstBuyers(unittest.TestCase):
                for i in range(1, 6)}
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, _ = fc.find_first_buyers(rpc, origin, limit=2, scan_cap=10)
+        buyers, _, _ = fc.find_first_buyers(rpc, origin, limit=2, scan_cap=10)
         self.assertEqual(len(buyers), 2)
 
     def test_respects_scan_cap_even_with_more_candidates(self):
@@ -966,7 +967,7 @@ class TestFindFirstBuyers(unittest.TestCase):
                for i in range(1, 11)}
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, _ = fc.find_first_buyers(rpc, origin, limit=100, scan_cap=3)
+        buyers, _, _ = fc.find_first_buyers(rpc, origin, limit=100, scan_cap=3)
         self.assertEqual(len(buyers), 3)
 
     def test_dedupes_the_same_wallet(self):
@@ -982,19 +983,69 @@ class TestFindFirstBuyers(unittest.TestCase):
         }
         rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
 
-        buyers, _ = fc.find_first_buyers(rpc, origin)
+        buyers, _, _ = fc.find_first_buyers(rpc, origin)
         self.assertEqual(len(buyers), 1)
 
     def test_skipped_when_walk_did_not_reach_true_genesis(self):
         origin = make_origin(exhausted=False, post_genesis_batch=[{"signature": "x"}])
-        buyers, notes = fc.find_first_buyers(ScriptedRPC({}), origin)
+        buyers, notes, skipped = fc.find_first_buyers(ScriptedRPC({}), origin)
         self.assertEqual(buyers, [])
         self.assertTrue(any("genesis" in n.lower() for n in notes))
+        self.assertTrue(skipped)
 
     def test_empty_batch_is_handled_without_crashing(self):
         origin = make_origin(exhausted=True, post_genesis_batch=[])
-        buyers, notes = fc.find_first_buyers(ScriptedRPC({}), origin)
+        buyers, notes, skipped = fc.find_first_buyers(ScriptedRPC({}), origin)
         self.assertEqual(buyers, [])
+
+    def test_zero_buys_found_is_not_the_same_as_skipped(self):
+        # Regression: a capped walk (skipped=True, zero buyers) was
+        # presented identically to "checked and genuinely found none"
+        # (skipped=False, zero buyers) in both the CLI and the website -
+        # exactly the "search did not run" vs "no mentions found"
+        # distinction this tool already draws elsewhere, missed here.
+        batch = [
+            {"signature": "not_a_buy", "blockTime": 1005},
+            {"signature": "genesis_sig", "blockTime": 1000},
+        ]
+        origin_checked = make_origin(exhausted=True, post_genesis_batch=batch)
+        txs = {"not_a_buy": make_tx("Someone", VALID_CA, pre_amt=500.0, post_amt=200.0)}
+        rpc = ScriptedRPC({"getTransaction": lambda p: txs.get(p[0])})
+        buyers, _, skipped = fc.find_first_buyers(rpc, origin_checked)
+        self.assertEqual(buyers, [])
+        self.assertFalse(skipped, "genuinely checked and found nothing is not a skip")
+
+        origin_capped = make_origin(exhausted=False, post_genesis_batch=[{"signature": "x"}])
+        buyers2, _, skipped2 = fc.find_first_buyers(ScriptedRPC({}), origin_capped)
+        self.assertEqual(buyers2, [])
+        self.assertTrue(skipped2, "a capped walk must report skipped, not zero-found")
+
+
+class TestBuildReportFirstBuyersSkipped(unittest.TestCase):
+    def _minimal_report_inputs(self):
+        origin = make_origin(exhausted=False, post_genesis_batch=[{"signature": "x"}])
+        cross = fc.CrossCheck(status="unavailable")
+        outcome = fc.SearchOutcome(status="mock", provider="mock")
+        triage = fc.triage_mentions([])
+        args = fc.parse_args(["--mock", VALID_CA])
+        return origin, cross, outcome, triage, args
+
+    def test_skipped_flag_reaches_the_report(self):
+        origin, cross, outcome, triage, args = self._minimal_report_inputs()
+        report = fc.build_report(
+            VALID_CA, origin, cross, outcome, triage, args,
+            buyers=[], buyer_notes=["First-buyer detection skipped: ..."], buyers_skipped=True,
+        )
+        self.assertEqual(report["first_buyers"]["wallets"], [])
+        self.assertTrue(report["first_buyers"]["skipped"])
+
+    def test_not_skipped_when_genuinely_checked(self):
+        origin, cross, outcome, triage, args = self._minimal_report_inputs()
+        report = fc.build_report(
+            VALID_CA, origin, cross, outcome, triage, args,
+            buyers=[], buyer_notes=[], buyers_skipped=False,
+        )
+        self.assertFalse(report["first_buyers"]["skipped"])
 
 
 class TestFindOtherLaunches(unittest.TestCase):
