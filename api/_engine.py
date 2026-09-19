@@ -214,6 +214,43 @@ def http_json(
 TICKER_RE = re.compile(r"^\$?[A-Za-z0-9_]{1,15}$")
 
 
+def mask_secret(url: str) -> str:
+    """Redact likely-secret query-string values before a URL is ever shown
+    back to a user, logged, or included in an error message they might paste
+    into a support channel - an RPC endpoint's api-key param is exactly the
+    kind of thing that should never end up sitting in plaintext there.
+    """
+    return re.sub(
+        r"(?i)\b((?:api|access)[_-]?(?:key|token|secret|password)|key|token|secret|password)"
+        r"=([^&\s]+)",
+        r"\1=***",
+        url,
+    )
+
+
+def clean_env_value(raw: str, *names: str) -> str:
+    """Recover a usable value from the most common ways a hosting UI's
+    environment-variable form gets filled in wrong by hand.
+
+    Seen in the wild: pasting the whole "NAME = value" line into a form
+    field meant to hold only the value (some tools' env-var forms are a
+    single "KEY=VALUE" text box; Vercel's is not, but the mistake is easy to
+    make anyway), or a value copied with its wrapping quotes still attached.
+    `names` are the variable's own name(s), matched case-insensitively.
+    """
+    val = (raw or "").strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        val = val[1:-1].strip()
+    for name in names:
+        m = re.match(rf"^{re.escape(name)}\s*=\s*(.+)$", val, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1].strip()
+            break
+    return val
+
+
 def validate_contract_address(raw: str) -> str:
     """Return a clean mint address, or raise with an actionable message.
 
@@ -280,7 +317,19 @@ class OnChainOrigin:
 
 class SolanaRPC:
     def __init__(self, endpoint: str, verbose: bool = False):
-        self.endpoint = endpoint
+        self.endpoint = clean_env_value(endpoint, "SOLANA_RPC_URL", "SOLANA_RPC", "RPC_URL")
+        # Any URI scheme is accepted here (not just http/https) so tests and
+        # future non-HTTP transports aren't penalized - the point of this
+        # check is only to catch a value that plainly isn't a URL at all,
+        # which "NAME = value" pasted whole into a form field produces.
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", self.endpoint):
+            raise FirstCallooorError(
+                f"SOLANA_RPC_URL doesn't look like a URL: {mask_secret(self.endpoint)!r}.\n"
+                "  A hosting UI's environment-variable form usually wants ONLY the URL in\n"
+                "  its value field - e.g. https://mainnet.helius-rpc.com/?api-key=YOUR_KEY -\n"
+                "  not 'SOLANA_RPC_URL = https://...' or a quoted/exported line. Check the\n"
+                "  value field itself, not just what you typed to set it."
+            )
         self.verbose = verbose
         self._id = 0
 
@@ -1403,6 +1452,15 @@ def select_provider(args: argparse.Namespace) -> tuple[str, Optional[str]]:
     ta_key = getattr(args, "twitterapi_key", None) or os.environ.get(
         "TWITTERAPI_IO_KEY"
     ) or os.environ.get("TWITTERAPI_KEY")
+
+    # Same copy-paste hazard as the RPC URL: a hosting UI's value field can
+    # end up holding "X_BEARER_TOKEN = AAAA..." or a quoted string instead of
+    # the bare credential, which would otherwise fail as an opaque 401/403
+    # far from here with no hint at the actual cause.
+    if x_token:
+        x_token = clean_env_value(x_token, "X_BEARER_TOKEN", "TWITTER_BEARER_TOKEN")
+    if ta_key:
+        ta_key = clean_env_value(ta_key, "TWITTERAPI_IO_KEY", "TWITTERAPI_KEY")
 
     requested = getattr(args, "provider", "auto")
     if requested == "x":

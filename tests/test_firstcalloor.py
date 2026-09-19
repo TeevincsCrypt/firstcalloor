@@ -600,6 +600,81 @@ class TestProviderSelection(unittest.TestCase):
         self.assertEqual((provider, cred), ("twitterapi.io", "cli-key"))
 
 
+class TestEnvValueCleaning(unittest.TestCase):
+    """Regression coverage for a real production incident: a hosting UI's
+    environment-variable form got filled in with the whole "NAME = value"
+    line instead of just the value, and the resulting urllib error
+    ("unknown url type: solana_rpc_url = https") was far too cryptic to
+    self-diagnose from.
+    """
+
+    def test_clean_env_value_strips_name_equals_prefix(self):
+        self.assertEqual(
+            fc.clean_env_value("SOLANA_RPC_URL = https://x.test/y", "SOLANA_RPC_URL"),
+            "https://x.test/y",
+        )
+
+    def test_clean_env_value_is_case_insensitive_on_name(self):
+        self.assertEqual(
+            fc.clean_env_value("solana_rpc_url=https://x.test", "SOLANA_RPC_URL"),
+            "https://x.test",
+        )
+
+    def test_clean_env_value_strips_wrapping_quotes(self):
+        self.assertEqual(fc.clean_env_value('"https://x.test"', "X"), "https://x.test")
+        self.assertEqual(fc.clean_env_value("'https://x.test'", "X"), "https://x.test")
+
+    def test_clean_env_value_strips_bare_whitespace(self):
+        self.assertEqual(fc.clean_env_value("  https://x.test  ", "X"), "https://x.test")
+
+    def test_clean_env_value_leaves_a_clean_value_untouched(self):
+        self.assertEqual(fc.clean_env_value("https://x.test", "X"), "https://x.test")
+
+    def test_clean_env_value_handles_missing_input(self):
+        self.assertEqual(fc.clean_env_value(None, "X"), "")
+        self.assertEqual(fc.clean_env_value("", "X"), "")
+
+    def test_solana_rpc_self_heals_the_reported_incident_value(self):
+        # The exact shape of value that produced "unknown url type:
+        # solana_rpc_url = https" in production.
+        rpc = fc.SolanaRPC("SOLANA_RPC_URL = https://mainnet.helius-rpc.com/?api-key=abc123")
+        self.assertEqual(rpc.endpoint, "https://mainnet.helius-rpc.com/?api-key=abc123")
+
+    def test_solana_rpc_rejects_a_genuinely_non_url_value_clearly(self):
+        with self.assertRaises(fc.FirstCallooorError) as ctx:
+            fc.SolanaRPC("not a url at all")
+        self.assertIn("doesn't look like a URL", str(ctx.exception))
+
+    def test_solana_rpc_error_message_masks_api_key(self):
+        with self.assertRaises(fc.FirstCallooorError) as ctx:
+            fc.SolanaRPC("RPC = also not a url, key=SUPERSECRET123")
+        self.assertNotIn("SUPERSECRET123", str(ctx.exception))
+
+    def test_mask_secret_redacts_common_credential_params(self):
+        masked = fc.mask_secret("https://x.test/?api-key=ABC&api_token=DEF&ok=1")
+        self.assertNotIn("ABC", masked)
+        self.assertNotIn("DEF", masked)
+        self.assertIn("ok=1", masked)
+
+    def test_select_provider_cleans_bearer_token_from_env(self):
+        args = argparse.Namespace(provider="auto", bearer_token=None, twitterapi_key=None)
+        os.environ["X_BEARER_TOKEN"] = "X_BEARER_TOKEN = AAAA1234"
+        try:
+            provider, cred = fc.select_provider(args)
+        finally:
+            del os.environ["X_BEARER_TOKEN"]
+        self.assertEqual((provider, cred), ("x", "AAAA1234"))
+
+    def test_select_provider_cleans_twitterapi_key_from_env(self):
+        args = argparse.Namespace(provider="auto", bearer_token=None, twitterapi_key=None)
+        os.environ["TWITTERAPI_IO_KEY"] = '"my-real-key"'
+        try:
+            provider, cred = fc.select_provider(args)
+        finally:
+            del os.environ["TWITTERAPI_IO_KEY"]
+        self.assertEqual((provider, cred), ("twitterapi.io", "my-real-key"))
+
+
 class TestOrigin(unittest.TestCase):
     def test_walks_to_genesis_and_takes_oldest(self):
         rpc = FakeRPC([sigs(fc.SIG_PAGE_SIZE), sigs(5, start_id=1000)])

@@ -43,7 +43,11 @@ Import the repo at [vercel.com/new](https://vercel.com/new). No build command,
 no framework preset, no `requirements.txt` — Vercel serves `index.html`
 statically and `api/analyze.py` as a Python function automatically.
 
-Then set environment variables under **Settings → Environment Variables**:
+Then set environment variables under **Settings → Environment Variables**.
+**The Value field holds only the value** — e.g. `https://mainnet.helius-rpc.com/?api-key=YOUR_KEY`,
+never `SOLANA_RPC_URL = https://...` or a quoted string. (The tool now
+auto-corrects that specific mistake for `SOLANA_RPC_URL` and the credential
+variables if you make it anyway, but it's cleaner to just enter the bare value.)
 
 | Variable | Needed? | Why |
 |---|---|---|
