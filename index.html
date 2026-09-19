@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FIRSTCALLOOR</title>
+<meta name="description" content="Find the earliest verifiable X mention of a Solana memecoin, anchored to its on-chain creation time.">
+<style>
+  :root{
+    --bg:#0a0b0e; --panel:#121419; --panel-2:#171a21; --line:#242832;
+    --text:#e7e9ee; --muted:#878da0; --faint:#5c6275;
+    --accent:#2bd97c; --accent-dim:#1a8a4f; --warn:#f5b23e; --bad:#f2555a;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--mono); font-size:15px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:900px; margin:0 auto; padding:40px 16px 80px}
+  header{margin-bottom:28px}
+  h1{
+    font-size:clamp(28px,6vw,42px); margin:0; letter-spacing:-.02em; font-weight:700;
+  }
+  h1 .dot{color:var(--accent)}
+  .tag{color:var(--muted); font-size:13px; margin-top:6px}
+  form{display:flex; gap:8px; margin:26px 0 8px; flex-wrap:wrap}
+  input[type=text]{
+    flex:1 1 320px; min-width:0; background:var(--panel); border:1px solid var(--line);
+    color:var(--text); font-family:var(--mono); font-size:14px;
+    padding:13px 14px; border-radius:8px; outline:none;
+  }
+  input[type=text]:focus{border-color:var(--accent-dim)}
+  button{
+    background:var(--accent); color:#04150c; border:0; font-family:var(--mono);
+    font-weight:700; font-size:14px; padding:13px 22px; border-radius:8px; cursor:pointer;
+  }
+  button:disabled{opacity:.5; cursor:progress}
+  .hint{color:var(--faint); font-size:12.5px}
+  .panel{
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:18px 20px; margin-top:16px;
+  }
+  .panel h2{
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--muted); margin:0 0 14px; font-weight:600;
+  }
+  .kv{display:grid; grid-template-columns:130px 1fr; gap:6px 14px; font-size:13.5px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0; word-break:break-all}
+  .ok{color:var(--accent)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .muted{color:var(--muted)} .faint{color:var(--faint)}
+  .hero{border-color:var(--accent-dim); background:linear-gradient(180deg,#0f1f16,var(--panel))}
+  .hero .handle{font-size:26px; font-weight:700; letter-spacing:-.01em}
+  .hero .called{color:var(--accent); font-size:17px; margin-top:4px}
+  .hero .body{margin-top:12px; color:var(--text); font-size:14px}
+  .hero a{color:var(--muted); font-size:12.5px; text-decoration:none; word-break:break-all}
+  .hero a:hover{color:var(--accent)}
+  ol.timeline{list-style:none; margin:0; padding:0; counter-reset:r}
+  ol.timeline li{
+    padding:13px 0 13px 40px; border-top:1px solid var(--line); position:relative;
+  }
+  ol.timeline li:first-child{border-top:0}
+  ol.timeline li::before{
+    counter-increment:r; content:counter(r);
+    position:absolute; left:0; top:13px; width:24px; height:24px; border-radius:6px;
+    background:var(--panel-2); color:var(--muted); font-size:12px;
+    display:grid; place-items:center;
+  }
+  .row1{display:flex; gap:10px; align-items:baseline; flex-wrap:wrap}
+  .row1 .h{font-weight:700}
+  .row1 .d{margin-left:auto; color:var(--accent); font-size:13px; white-space:nowrap}
+  .row2{color:var(--muted); font-size:13px; margin-top:3px}
+  .row3{margin-top:3px}
+  .row3 a{color:var(--faint); font-size:12px; text-decoration:none; word-break:break-all}
+  .row3 a:hover{color:var(--accent)}
+  .note{
+    border-left:2px solid var(--warn); background:#1a1710; padding:10px 14px;
+    margin-top:10px; font-size:13px; color:#e3d3b4; border-radius:0 6px 6px 0;
+  }
+  .note.bad{border-color:var(--bad); background:#1c1112; color:#f0cbcd}
+  .note.info{border-color:var(--accent-dim); background:#0f1a14; color:#bfe3cf}
+  .note code{background:#00000055; padding:1px 5px; border-radius:4px}
+  .flagrow{
+    display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;
+    padding:8px 0; border-top:1px solid var(--line); font-size:13px;
+  }
+  .flagrow:first-of-type{border-top:0}
+  .flagrow .d{margin-left:auto; white-space:nowrap}
+  .flagrow a{color:var(--faint); text-decoration:none}
+  .flagrow a:hover{color:var(--accent)}
+  pre.err{white-space:pre-wrap; margin:0; font-size:13px; color:#f0cbcd}
+  footer{margin-top:40px; color:var(--faint); font-size:12px; text-align:center}
+  footer a{color:var(--muted)}
+  .spin{display:inline-block; animation:b 1s steps(2) infinite}
+  @keyframes b{50%{opacity:0}}
+  @media (max-width:520px){ .kv{grid-template-columns:1fr} .kv dt{color:var(--faint)} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>FIRSTCALLOOR<span class="dot">.</span></h1>
+    <div class="tag">Who called it first &mdash; anchored to the token's real on-chain birth, not a self-reported timestamp.</div>
+  </header>
+
+  <form id="f">
+    <input id="ca" type="text" spellcheck="false" autocomplete="off"
+           placeholder="Paste a Solana contract address (not a ticker)">
+    <button id="go" type="submit">Trace</button>
+  </form>
+  <div class="hint">Tickers are rejected on purpose &mdash; they collide, and a wrong &ldquo;first call&rdquo; is worse than none.</div>
+
+  <div id="out"></div>
+
+  <footer>
+    on-chain zero point via Solana RPC &middot; mentions via X API v2 &middot;
+    <a href="https://github.com/TeevincsCrypt/firstcalloor">source</a>
+  </footer>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const out = $("#out"), form = $("#f"), input = $("#ca"), btn = $("#go");
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+
+const fmtNum = (n) => n == null ? "?" :
+  n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
+
+function panel(title, inner, cls = "") {
+  return `<section class="panel ${cls}"><h2>${title}</h2>${inner}</section>`;
+}
+
+function notes(list, cls = "") {
+  return (list || []).map(n => `<div class="note ${cls}">${esc(n)}</div>`).join("");
+}
+
+function renderToken(d) {
+  const o = d.origin, c = d.cross_check;
+  const name = d.token.name ? `${esc(d.token.name)} ($${esc(d.token.symbol)})`
+                            : `<span class="faint">not resolved</span>`;
+  let xc;
+  if (c.status === "agree")
+    xc = `<span class="ok">pump.fun agrees</span> <span class="faint">(&Delta; ${c.delta_seconds}s)</span>`;
+  else if (c.status === "disagree")
+    xc = `<span class="warn">pump.fun disagrees by ${c.delta_seconds}s</span>
+          <span class="faint">&mdash; it says ${esc(c.reported_at)}. The on-chain time is what we trust.</span>`;
+  else
+    xc = `<span class="faint">unavailable &mdash; ${esc(c.detail || "no data")}</span>`;
+
+  const genesis = o.reached_genesis
+    ? `<span class="ok">reached genesis</span>`
+    : `<span class="warn">capped &mdash; may not be genesis</span>`;
+
+  return panel("Token", `
+    <dl class="kv">
+      <dt>Contract</dt><dd>${esc(d.input.contract_address)}</dd>
+      <dt>Name</dt><dd>${name}</dd>
+      <dt>Created</dt><dd><span class="ok">${esc(o.created_at)}</span>
+        <span class="faint">&larr; zero point, on-chain</span></dd>
+      <dt>Genesis tx</dt><dd class="faint">${esc(o.genesis_signature)}</dd>
+      <dt>History</dt><dd>${o.signatures_scanned.toLocaleString()} txs over
+        ${o.pages_scanned} page(s) &middot; ${genesis}</dd>
+      <dt>Cross-check</dt><dd>${xc}</dd>
+    </dl>
+    ${notes(o.warnings)}
+  `);
+}
+
+function renderFirstCall(d) {
+  const s = d.search;
+  if (!d.first_call) {
+    const searchRan = !["no_credentials","forbidden","error"].includes(s.status);
+    const head = searchRan
+      ? `<div class="warn">No public mentions found.</div>` +
+        (s.complete ? "" : `<div class="faint">The search was incomplete, so this is not proof of absence.</div>`)
+      : `<div class="warn">Mention search did not run.</div>
+         <div class="faint">The on-chain zero point above is still real.</div>`;
+    return panel("First call", head + notes(s.notes, searchRan ? "" : "info"));
+  }
+  const f = d.first_call;
+  return panel("First call", `
+    <div class="handle">@${esc(f.handle)}</div>
+    <div class="muted">${fmtNum(f.followers_at_query_time)} followers at query time</div>
+    <div class="called">Called ${esc(f.time_since_creation)} after launch
+      <span class="faint">&middot; ${esc(f.tweeted_at)}</span></div>
+    <div class="body">${esc(f.text)}</div>
+    <div style="margin-top:10px"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a></div>
+  `, "hero") + panel("Search", `
+    <dl class="kv">
+      <dt>Query</dt><dd>${esc(s.query)} <span class="faint">(exact CA, never the ticker)</span></dd>
+      <dt>Window</dt><dd class="muted">${esc(s.window_start)} &rarr; ${esc(s.window_end)}</dd>
+      <dt>Coverage</dt><dd>${s.complete ? '<span class="ok">complete</span>'
+                                        : '<span class="warn">incomplete</span>'}</dd>
+    </dl>${notes(s.notes)}`);
+}
+
+function renderTimeline(d) {
+  if (!d.timeline.length) return "";
+  const items = d.timeline.map(m => `
+    <li>
+      <div class="row1">
+        <span class="h">@${esc(m.handle)}</span>
+        <span class="faint">${fmtNum(m.followers_at_query_time)}</span>
+        <span class="d">+${esc(m.time_since_creation)}</span>
+      </div>
+      <div class="row2">${esc(m.text)}</div>
+      <div class="row3"><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.tweeted_at)} &middot; ${esc(m.url)}</a></div>
+    </li>`).join("");
+  return panel(`Timeline &mdash; earliest ${d.timeline.length} genuine mentions`,
+               `<ol class="timeline">${items}</ol>`);
+}
+
+function renderFlagged(d) {
+  let html = "";
+  const bots = d.possible_bot_mentions || [];
+  if (bots.length) {
+    html += panel(`Possible bot mentions (${bots.length})`, `
+      <div class="faint" style="margin-bottom:10px">Accounts created in the last 24h.
+        Surfaced, never ranked &mdash; usually a bot, occasionally a real early caller.</div>
+      ${bots.map(m => `<div class="flagrow">
+          <span class="warn">~</span><span>@${esc(m.handle)}</span>
+          <span class="faint">${m.account_age_hours?.toFixed(1) ?? "?"}h old</span>
+          <span class="d"><a href="${esc(m.url)}" target="_blank" rel="noopener">+${esc(m.time_since_creation)}</a></span>
+        </div>`).join("")}`);
+  }
+  const pre = d.filtered?.pre_creation || [];
+  if (pre.length) {
+    html += panel(`Filtered &mdash; posted before the token existed (${pre.length})`, `
+      <div class="faint" style="margin-bottom:10px">Timestamped before the mint existed on-chain,
+        so they cannot be calls on it: a recycled or impersonated CA, a scraper reposting old
+        text, or clock skew. Excluded from the ranking by design.</div>
+      ${pre.map(m => `<div class="flagrow">
+          <span class="bad">&times;</span><span>@${esc(m.handle)}</span>
+          <span class="faint">${esc(m.tweeted_at)}</span>
+          <span class="d"><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.time_since_creation)}</a></span>
+        </div>`).join("")}`);
+  }
+  const rt = (d.filtered?.retweets || []).length, qt = (d.filtered?.quote_tweets || []).length;
+  if (rt + qt) {
+    html += panel(`Filtered &mdash; amplification (${rt + qt})`,
+      `<div class="faint">${rt} retweet(s) and ${qt} quote tweet(s) excluded as non-original.</div>`);
+  }
+  return html;
+}
+
+async function run(ca) {
+  btn.disabled = true;
+  out.innerHTML = panel("Working",
+    `<div class="muted">Walking the mint's signature history back to genesis<span class="spin">_</span></div>
+     <div class="faint" style="margin-top:6px">Busy tokens take a few seconds.</div>`);
+  try {
+    const res = await fetch(`/api/analyze?ca=${encodeURIComponent(ca)}`);
+    const data = await res.json();
+    if (!res.ok && res.status !== 206) {
+      out.innerHTML = panel("Cannot trace this",
+        `<pre class="err">${esc(data.message || "Unknown error")}</pre>`);
+      return;
+    }
+    out.innerHTML = renderToken(data) + renderFirstCall(data)
+                  + renderTimeline(data) + renderFlagged(data);
+  } catch (e) {
+    out.innerHTML = panel("Request failed", `<pre class="err">${esc(e.message)}</pre>`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const ca = input.value.trim();
+  if (!ca) return;
+  history.replaceState(null, "", `?ca=${encodeURIComponent(ca)}`);
+  run(ca);
+});
+
+const preset = new URLSearchParams(location.search).get("ca");
+if (preset) { input.value = preset; run(preset); }
+</script>
+</body>
+</html>

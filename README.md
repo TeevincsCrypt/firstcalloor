@@ -18,21 +18,56 @@ FIRST CALL
 
 ---
 
+Runs as a **website** and as a **CLI**, off the same engine.
+
 ## Quick start
 
-No dependencies — stdlib only, Python 3.9+.
+No dependencies — stdlib only, Python 3.9+. Nothing to install.
 
 ```bash
-# See the full output format with synthetic mentions (no API key needed).
-# The on-chain half is still real.
-python firstcalloor.py <CONTRACT_ADDRESS> --mock
-
-# The real thing, once you have an X API key with search access.
-export X_BEARER_TOKEN="AAAAAAAA..."
-python firstcalloor.py <CONTRACT_ADDRESS>
+python dev_server.py                       # website at http://localhost:8000
+python firstcalloor.py <CONTRACT_ADDRESS>  # same engine, in the terminal
 ```
 
-Results print to console and land in `firstcalloor-<ca8>.json`.
+The CLI prints a table and writes `firstcalloor-<ca8>.json`.
+
+**Without an X API key the on-chain half still works** — real creation
+timestamp, real genesis transaction, verified against the chain. The mention
+search then reports that it did not run, rather than implying there was
+nothing to find. Add `--mock` on the CLI to see the full output shape against
+synthetic mentions.
+
+## Deploy to Vercel
+
+Import the repo at [vercel.com/new](https://vercel.com/new). No build command,
+no framework preset, no `requirements.txt` — Vercel serves `index.html`
+statically and `api/analyze.py` as a Python function automatically.
+
+Then set environment variables under **Settings → Environment Variables**:
+
+| Variable | Needed? | Why |
+|---|---|---|
+| `SOLANA_RPC_URL` | **Strongly recommended** | The default public RPC rate-limits cloud IPs hard; a hosted deploy will hit 429s without a dedicated endpoint. A free Helius key is enough. |
+| `X_BEARER_TOKEN` | Required for mentions | Without it the site shows on-chain data only. |
+| `X_FULL_ARCHIVE` | Optional | `1` to use full-archive search (X API Pro). |
+| `FIRSTCALLOOR_SIG_PAGE_CAP` | Optional | Signature pages per request, default `12`. Lower it if you hit the function timeout. |
+
+**Serverless timeouts matter here.** Walking a busy token's signature history
+back to genesis is the slow part, and Vercel Hobby caps functions at 10s. The
+web path uses a tighter page cap than the CLI and says which happened —
+`reached genesis` or `capped` — rather than silently reporting a wrong birth
+time.
+
+### Project layout
+
+```
+index.html           frontend, vanilla JS, no build step
+api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
+api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
+firstcalloor.py      CLI wrapper around that same engine
+dev_server.py        local server mirroring Vercel's routing
+tests/               33 tests, no network or API key needed
+```
 
 ---
 
@@ -191,4 +226,4 @@ clamp — is verified without network access or an API key.
 → console + JSON.
 
 **Out:** Telegram scanning, follower-weighted "market mover" scoring,
-persistence. Single-run script, no database.
+persistence. No database — every request is computed fresh.

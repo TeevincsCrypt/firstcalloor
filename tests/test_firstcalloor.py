@@ -11,9 +11,9 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "api"))
 
-import firstcalloor as fc
+import _engine as fc
 
 
 VALID_CA = "6g7YqRniiD5fqCs9uW61QKjmsc6SYgR14mY5sNPzpump"
