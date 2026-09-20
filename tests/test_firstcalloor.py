@@ -6,6 +6,7 @@ network access or an API key.
 """
 
 import argparse
+import base64
 import os
 import re
 import sys
@@ -1323,6 +1324,416 @@ class TestInsiderCorrelation(unittest.TestCase):
 
     def test_handles_empty_mentions_list(self):
         fc.flag_insider_mentions([], ["SomeWallet"])  # must not raise
+
+
+# --------------------------------------------------------------------------
+# base58 encoding + program-derived addresses
+# --------------------------------------------------------------------------
+
+class TestBase58Encode(unittest.TestCase):
+    def test_round_trips_a_real_address(self):
+        self.assertEqual(fc.b58_encode(fc.b58_decode(VALID_CA)), VALID_CA)
+
+    def test_round_trips_leading_zero_bytes(self):
+        # Leading zero bytes encode as leading '1's; losing them would produce
+        # a different, wrong address rather than an obvious error.
+        raw = b"\x00\x00" + b"\x11" * 30
+        self.assertTrue(fc.b58_encode(raw).startswith("11"))
+        self.assertEqual(fc.b58_decode(fc.b58_encode(raw)), raw)
+
+    def test_empty_input(self):
+        self.assertEqual(fc.b58_encode(b""), "")
+
+
+class TestFindProgramAddress(unittest.TestCase):
+    def test_matches_known_metaplex_pda(self):
+        # USDC's real metadata account: verified against mainnet, where this
+        # address is owned by the Metaplex program and decodes to "USD Coin".
+        # If the bump walk or the curve check drifts, this comes out different.
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        pda = fc.find_program_address(
+            [b"metadata", fc.b58_decode(fc.METAPLEX_METADATA_PROGRAM), fc.b58_decode(usdc)],
+            fc.METAPLEX_METADATA_PROGRAM,
+        )
+        self.assertEqual(pda, "5x38Kp4hvdomTCnCrAny4UtMUt5rQBdB6px2K1Ui45Wq")
+
+    def test_result_is_off_curve(self):
+        pda = fc.find_program_address(
+            [b"metadata", fc.b58_decode(fc.METAPLEX_METADATA_PROGRAM), fc.b58_decode(VALID_CA)],
+            fc.METAPLEX_METADATA_PROGRAM,
+        )
+        self.assertFalse(fc._is_on_ed25519_curve(fc.b58_decode(pda)))
+
+    def test_is_deterministic(self):
+        seeds = [b"metadata", fc.b58_decode(fc.METAPLEX_METADATA_PROGRAM), fc.b58_decode(VALID_CA)]
+        self.assertEqual(
+            fc.find_program_address(seeds, fc.METAPLEX_METADATA_PROGRAM),
+            fc.find_program_address(seeds, fc.METAPLEX_METADATA_PROGRAM),
+        )
+
+
+# --------------------------------------------------------------------------
+# token identity - the name, straight from the chain
+# --------------------------------------------------------------------------
+
+def token2022_mint(name="Dons", symbol="DONS", uri="https://example.test/d.json"):
+    return {
+        "decimals": 6,
+        "supply": "1000000000000000",
+        "extensions": [
+            {"extension": "transferFeeConfig", "state": {}},
+            {"extension": "tokenMetadata",
+             "state": {"name": name, "symbol": symbol, "uri": uri}},
+        ],
+    }
+
+
+def metaplex_account(name="USD Coin", symbol="USDC", uri="https://example.test/u.json"):
+    """A Metaplex metadata account, encoded the way the chain returns it."""
+    def borsh_str(s):
+        raw = s.encode("utf-8")
+        return len(raw).to_bytes(4, "little") + raw
+    blob = (b"\x04" + b"\x01" * 32 + b"\x02" * 32
+            + borsh_str(name) + borsh_str(symbol) + borsh_str(uri))
+    return {"value": {"data": [base64.b64encode(blob).decode(), "base64"]}}
+
+
+class TestResolveTokenIdentity(unittest.TestCase):
+    def test_reads_token_2022_embedded_metadata(self):
+        rpc = ScriptedRPC({})
+        identity = fc.resolve_token_identity(rpc, VALID_CA, token2022_mint())
+        self.assertEqual(identity.name, "Dons")
+        self.assertEqual(identity.symbol, "DONS")
+        self.assertEqual(identity.source, "token-2022")
+        # The name was already in the mint account the risk check fetched, so
+        # resolving it must cost no extra RPC call at all.
+        self.assertEqual(rpc.calls, [])
+
+    def test_falls_back_to_metaplex_for_classic_spl(self):
+        rpc = ScriptedRPC({"getAccountInfo": lambda p: metaplex_account()})
+        identity = fc.resolve_token_identity(rpc, VALID_CA, {"decimals": 6, "supply": "1"})
+        self.assertEqual(identity.name, "USD Coin")
+        self.assertEqual(identity.symbol, "USDC")
+        self.assertEqual(identity.source, "metaplex")
+
+    def test_fetches_the_mint_itself_when_not_given_one(self):
+        seen = []
+
+        def account_info(params):
+            seen.append(params[0])
+            if params[0] == VALID_CA:
+                return {"value": {"data": {"parsed": {"info": token2022_mint()}}}}
+            return None
+
+        identity = fc.resolve_token_identity(ScriptedRPC({"getAccountInfo": account_info}), VALID_CA)
+        self.assertEqual(identity.source, "token-2022")
+        self.assertEqual(seen, [VALID_CA])
+
+    def test_unavailable_when_nothing_has_the_name(self):
+        rpc = ScriptedRPC({"getAccountInfo": {"value": None}})
+        identity = fc.resolve_token_identity(rpc, VALID_CA, {"decimals": 6})
+        self.assertIsNone(identity.name)
+        self.assertEqual(identity.source, "unavailable")
+
+    def test_rpc_failure_degrades_instead_of_raising(self):
+        def boom(params):
+            raise fc.FirstCallooorError("RPC down")
+
+        identity = fc.resolve_token_identity(ScriptedRPC({"getAccountInfo": boom}), VALID_CA)
+        self.assertEqual(identity.source, "unavailable")
+
+    def test_ignores_a_blank_embedded_name(self):
+        # An extension present but empty must not beat the Metaplex fallback.
+        mint = token2022_mint(name="  ", symbol="")
+        rpc = ScriptedRPC({"getAccountInfo": lambda p: metaplex_account()})
+        identity = fc.resolve_token_identity(rpc, VALID_CA, mint)
+        self.assertEqual(identity.source, "metaplex")
+
+    def test_truncated_metaplex_account_does_not_raise(self):
+        rpc = ScriptedRPC({"getAccountInfo": {"value": {"data": [base64.b64encode(b"\x04" * 10).decode(), "base64"]}}})
+        identity = fc.resolve_token_identity(rpc, VALID_CA, {"decimals": 6})
+        self.assertEqual(identity.source, "unavailable")
+
+
+# --------------------------------------------------------------------------
+# dev holdings
+# --------------------------------------------------------------------------
+
+def token_accounts(*amounts):
+    return {"value": [
+        {"account": {"data": {"parsed": {"info": {"tokenAmount": {"uiAmount": a}}}}}}
+        for a in amounts
+    ]}
+
+
+class TestGetWalletHolding(unittest.TestCase):
+    def test_sums_every_token_account_for_the_wallet(self):
+        rpc = ScriptedRPC({"getTokenAccountsByOwner": token_accounts(100.0, 50.5)})
+        amount, pct, known = fc.get_wallet_holding(rpc, "DevWallet1", VALID_CA, 1000.0)
+        self.assertEqual(amount, 150.5)
+        self.assertEqual(pct, 15.05)
+        self.assertTrue(known)
+
+    def test_zero_balance_is_known_not_unknown(self):
+        # "Dev sold everything" and "we could not check" must never collapse
+        # into the same rendered claim.
+        rpc = ScriptedRPC({"getTokenAccountsByOwner": {"value": []}})
+        amount, pct, known = fc.get_wallet_holding(rpc, "DevWallet1", VALID_CA, 1000.0)
+        self.assertEqual(amount, 0.0)
+        self.assertEqual(pct, 0.0)
+        self.assertTrue(known)
+
+    def test_rpc_failure_is_unknown(self):
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+
+        amount, pct, known = fc.get_wallet_holding(
+            ScriptedRPC({"getTokenAccountsByOwner": boom}), "DevWallet1", VALID_CA, 1000.0)
+        self.assertIsNone(amount)
+        self.assertIsNone(pct)
+        self.assertFalse(known)
+
+    def test_no_wallet_is_unknown_and_costs_no_call(self):
+        rpc = ScriptedRPC({})
+        self.assertEqual(fc.get_wallet_holding(rpc, None, VALID_CA, 1000.0), (None, None, False))
+        self.assertEqual(rpc.calls, [])
+
+    def test_percentage_omitted_without_a_known_supply(self):
+        rpc = ScriptedRPC({"getTokenAccountsByOwner": token_accounts(10.0)})
+        amount, pct, known = fc.get_wallet_holding(rpc, "DevWallet1", VALID_CA, None)
+        self.assertEqual(amount, 10.0)
+        self.assertIsNone(pct)
+        self.assertTrue(known)
+
+    def test_queries_only_the_mint_in_question(self):
+        rpc = ScriptedRPC({"getTokenAccountsByOwner": token_accounts(1.0)})
+        fc.get_wallet_holding(rpc, "DevWallet1", VALID_CA, 1000.0)
+        method, params = rpc.calls[0]
+        self.assertEqual(method, "getTokenAccountsByOwner")
+        self.assertEqual(params[0], "DevWallet1")
+        self.assertEqual(params[1], {"mint": VALID_CA})
+
+
+# --------------------------------------------------------------------------
+# name collisions - other tokens already using this name
+# --------------------------------------------------------------------------
+
+def pair(address, name="Dons", symbol="DONS", created_ms=1_600_000_000_000, chain="solana"):
+    return {
+        "chainId": chain,
+        "pairCreatedAt": created_ms,
+        "baseToken": {"address": address, "name": name, "symbol": symbol},
+    }
+
+
+class TestFindNameCollisions(unittest.TestCase):
+    def setUp(self):
+        self.original = fc.http_json
+        self.requested = []
+
+    def tearDown(self):
+        fc.http_json = self.original
+
+    def stub(self, payload):
+        def fake(url, **kwargs):
+            self.requested.append(url)
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        fc.http_json = fake
+
+    def test_skips_without_a_name_and_makes_no_request(self):
+        self.stub({"pairs": []})
+        result = fc.find_name_collisions(None, VALID_CA)
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(self.requested, [])
+
+    def test_finds_an_older_twin(self):
+        self.stub({"pairs": [
+            pair("OtherMint1", created_ms=1_600_000_000_000),
+            pair("OtherMint2", created_ms=1_500_000_000_000),
+        ]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.oldest.mint, "OtherMint2")
+        self.assertEqual([t.mint for t in result.twins], ["OtherMint2", "OtherMint1"])
+        self.assertIn("q=Dons", self.requested[0])
+
+    def test_excludes_the_token_being_analysed(self):
+        self.stub({"pairs": [pair(VALID_CA), pair("OtherMint1")]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual([t.mint for t in result.twins], ["OtherMint1"])
+
+    def test_excludes_other_chains(self):
+        self.stub({"pairs": [pair("EthMint1", chain="ethereum"), pair("SolMint1")]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual([t.mint for t in result.twins], ["SolMint1"])
+
+    def test_excludes_loose_search_matches(self):
+        # DexScreener matches substrings; only an exact name or symbol hit is
+        # actually the same name, and claiming otherwise is a false alarm.
+        self.stub({"pairs": [
+            pair("Loose1", name="Dons Inu", symbol="DONSINU"),
+            pair("Exact1", name="Dons", symbol="DONS"),
+        ]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual([t.mint for t in result.twins], ["Exact1"])
+
+    def test_matches_on_symbol_and_ignores_case(self):
+        self.stub({"pairs": [pair("Sym1", name="Something Else", symbol="dOnS")]})
+        result = fc.find_name_collisions("DONS", VALID_CA)
+        self.assertEqual([t.mint for t in result.twins], ["Sym1"])
+
+    def test_dedupes_pairs_keeping_the_earliest_per_mint(self):
+        self.stub({"pairs": [
+            pair("OtherMint1", created_ms=1_600_000_000_000),
+            pair("OtherMint1", created_ms=1_400_000_000_000),
+            pair("OtherMint1", created_ms=1_700_000_000_000),
+        ]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(len(result.twins), 1)
+        self.assertEqual(result.twins[0].first_pair_unix, 1_400_000_000)
+
+    def test_undated_twins_sort_last_and_never_become_the_oldest(self):
+        self.stub({"pairs": [
+            pair("NoDate1", created_ms=None),
+            pair("Dated1", created_ms=1_600_000_000_000),
+        ]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual([t.mint for t in result.twins], ["Dated1", "NoDate1"])
+        self.assertEqual(result.oldest.mint, "Dated1")
+
+    def test_caps_the_number_of_twins_reported(self):
+        self.stub({"pairs": [
+            pair(f"Mint{i}", created_ms=1_500_000_000_000 + i) for i in range(20)
+        ]})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(len(result.twins), fc.NAME_MATCH_LIMIT)
+
+    def test_no_matches_says_so_rather_than_going_quiet(self):
+        self.stub({"pairs": []})
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.twins, [])
+        self.assertIn("No other Solana token", result.detail)
+
+    def test_http_error_degrades_to_unavailable(self):
+        self.stub(fc.HttpError(403, "blocked", fc.DEXSCREENER_SEARCH))
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("403", result.detail)
+
+    def test_any_other_failure_degrades_to_unavailable(self):
+        self.stub(ValueError("bad json"))
+        result = fc.find_name_collisions("Dons", VALID_CA)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.searched_name, "Dons")
+
+    def test_serialised_result_carries_the_date_caveat(self):
+        self.stub({"pairs": [pair("OtherMint1")]})
+        payload = fc.find_name_collisions("Dons", VALID_CA).to_dict()
+        self.assertEqual(payload["count"], 1)
+        self.assertIn("first traded", payload["caveat"])
+        self.assertTrue(payload["twins"][0]["chart_url"].endswith("OtherMint1"))
+
+
+# --------------------------------------------------------------------------
+# the report's token block
+# --------------------------------------------------------------------------
+
+class TestReportTokenIdentity(unittest.TestCase):
+    def build(self, identity, collisions=None):
+        args = fc.parse_args(["--mock", VALID_CA])
+        return fc.build_report(
+            VALID_CA, make_origin(), fc.CrossCheck(status="unavailable", name="From pump.fun"),
+            fc.SearchOutcome(status="ok"), fc.Triage(), args,
+            identity=identity, collisions=collisions,
+        )
+
+    def test_prefers_the_on_chain_name_over_pump_fun(self):
+        report = self.build(fc.TokenIdentity(name="Dons", symbol="DONS", source="token-2022"))
+        self.assertEqual(report["token"]["name"], "Dons")
+        self.assertEqual(report["token"]["name_source"], "token-2022")
+
+    def test_falls_back_to_pump_fun_when_the_chain_had_nothing(self):
+        report = self.build(fc.TokenIdentity())
+        self.assertEqual(report["token"]["name"], "From pump.fun")
+        self.assertEqual(report["token"]["name_source"], "unavailable")
+
+    def test_name_collisions_absent_when_not_checked(self):
+        self.assertIsNone(self.build(fc.TokenIdentity())["name_collisions"])
+
+
+# --------------------------------------------------------------------------
+# wall-clock budget
+# --------------------------------------------------------------------------
+
+class TestTimeBudget(unittest.TestCase):
+    def test_no_limit_affords_everything(self):
+        b = fc.TimeBudget(None)
+        self.assertTrue(b.can_afford(9999.0))
+        self.assertIsNone(b.remaining())
+
+    def test_keeps_the_search_reserve_back(self):
+        # 10s budget, 4s reserved for the search: a 7s phase must not run
+        # even though 7 < 10, or the search it was meant to protect starves.
+        b = fc.TimeBudget(10.0, reserve=4.0)
+        self.assertTrue(b.can_afford(5.0))
+        self.assertFalse(b.can_afford(7.0))
+
+    def test_reserve_can_be_waived_per_check(self):
+        b = fc.TimeBudget(10.0, reserve=4.0)
+        self.assertTrue(b.can_afford(7.0, keep_reserve=False))
+
+    def test_nothing_is_affordable_once_the_budget_is_spent(self):
+        b = fc.TimeBudget(10.0, reserve=0.0)
+        b.started -= 11.0          # pretend 11s have passed
+        self.assertFalse(b.can_afford(0.1))
+        self.assertLess(b.remaining(), 0)
+
+    def test_skip_note_says_it_was_not_checked(self):
+        # The wording is the point: a skipped check must never be readable as
+        # a result. This project's whole premise is that a wrong answer is
+        # worse than no answer.
+        b = fc.TimeBudget(10.0)
+        msg = b.note_skip("Dev history scan")
+        self.assertIn("Dev history scan", msg)
+        self.assertIn("not checked", msg)
+        self.assertIn("not a finding", msg)
+        self.assertEqual(b.skipped, [msg])
+
+
+class TestSkippedScanIsNotACleanResult(unittest.TestCase):
+    def test_unscanned_dev_is_not_reported_as_having_no_launches(self):
+        scanned = fc.DevProfile(dev_wallet="DevWallet1", other_launches=[])
+        skipped = fc.DevProfile(dev_wallet="DevWallet1", other_launches=[], scan_ran=False)
+        self.assertFalse(scanned.is_serial_deployer)
+        self.assertFalse(skipped.is_serial_deployer)
+        # Both have zero launches, but only one of them actually looked.
+        self.assertTrue(scanned.to_dict()["scan_ran"])
+        self.assertFalse(skipped.to_dict()["scan_ran"])
+
+    def test_risk_verdict_records_that_dev_history_was_not_checked(self):
+        rpc = ScriptedRPC({
+            "getAccountInfo": {"value": {"data": {"parsed": {"info": {
+                "decimals": 6, "supply": "1000000", "mintAuthority": None,
+                "freezeAuthority": None}}}}},
+            "getTokenLargestAccounts": {"value": []},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA,
+                               fc.DevProfile(dev_wallet="DevWallet1", scan_ran=False))
+        self.assertTrue(any("not checked" in n for n in risk.notes))
+
+    def test_risk_says_nothing_extra_when_the_scan_did_run(self):
+        rpc = ScriptedRPC({
+            "getAccountInfo": {"value": {"data": {"parsed": {"info": {
+                "decimals": 6, "supply": "1000000", "mintAuthority": None,
+                "freezeAuthority": None}}}}},
+            "getTokenLargestAccounts": {"value": []},
+        })
+        risk = fc.assess_risk(rpc, VALID_CA, fc.DevProfile(dev_wallet="DevWallet1"))
+        self.assertFalse(any("not checked" in n for n in risk.notes))
 
 
 if __name__ == "__main__":

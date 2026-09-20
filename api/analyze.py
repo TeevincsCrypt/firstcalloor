@@ -80,15 +80,29 @@ WEB_FIRST_BUYERS_SCAN_CAP = int(os.environ.get("FIRSTCALLOOR_FIRST_BUYERS_SCAN_C
 WEB_DEV_SCAN_CAP = int(os.environ.get("FIRSTCALLOOR_DEV_SCAN_CAP", "8"))
 WEB_DEV_SCAN_MAX_LAUNCHES = int(os.environ.get("FIRSTCALLOOR_DEV_SCAN_MAX_LAUNCHES", "2"))
 WEB_NO_FIRST_BUYERS = os.environ.get("FIRSTCALLOOR_NO_FIRST_BUYERS", "0").lower() in ("1", "true", "yes", "on")
-# Measured against a live token: resolve_origin ~1.9s, first buyers ~1.0s,
-# risk check ~0.3s, dev scan ~2.4s - dev scan is the priciest of the three
-# and the least urgent for an at-a-glance decision (rug signal + who's
-# already bought matter more immediately than "has this dev launched other
-# tokens"), so it defaults OFF on web to leave headroom for the cross-check
-# and mention search that still have to run in the same ~10s budget. The
-# CLI has no such pressure and runs it by default.
-WEB_NO_DEV_SCAN = os.environ.get("FIRSTCALLOOR_NO_DEV_SCAN", "1").lower() in ("1", "true", "yes", "on")
+# The dev-wallet scan is on by default now that dev history is part of what
+# the page is expected to show. It is paid for by dropping the pump.fun
+# cross-check below, which cost strictly more (up to a 6s timeout) and gave
+# strictly less: its only unique value was the token name, and that now
+# comes off-chain-free from the mint account itself.
+WEB_NO_DEV_SCAN = os.environ.get("FIRSTCALLOOR_NO_DEV_SCAN", "0").lower() in ("1", "true", "yes", "on")
 WEB_NO_RISK_CHECK = os.environ.get("FIRSTCALLOOR_NO_RISK_CHECK", "0").lower() in ("1", "true", "yes", "on")
+WEB_NO_NAME_CHECK = os.environ.get("FIRSTCALLOOR_NO_NAME_CHECK", "0").lower() in ("1", "true", "yes", "on")
+# pump.fun's API has returned 530 on every single call this project has ever
+# made to it, and a hanging attempt can eat 6s of a ~10s budget for an
+# advisory timestamp cross-check. The token name - the only thing it gave
+# that mattered - is now read from the chain, so the web path skips it.
+WEB_NO_CROSS_CHECK = os.environ.get("FIRSTCALLOOR_NO_CROSS_CHECK", "1").lower() in ("1", "true", "yes", "on")
+
+
+# The whole run has to finish inside vercel.json's maxDuration (10s on
+# Hobby), and overrunning it is not a slow page - Vercel kills the process
+# and the browser gets the platform's opaque crash page instead of this
+# file's JSON. HttpBudget above bounds any single request; this bounds the
+# run, which is the different failure of many individually-fine calls adding
+# up. The default leaves ~2.5s of headroom for process start, JSON encoding
+# and the response itself.
+WEB_TIME_BUDGET = float(os.environ.get("FIRSTCALLOOR_TIME_BUDGET", "7.5"))
 
 
 def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
@@ -102,10 +116,12 @@ def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
         sig_page_cap=WEB_SIG_PAGE_CAP,
         include_retweets=include_retweets,
         pre_window_hours=WEB_PRE_WINDOW_HOURS,
-        no_cross_check=False,
+        no_cross_check=WEB_NO_CROSS_CHECK,
         no_first_buyers=WEB_NO_FIRST_BUYERS,
         no_dev_scan=WEB_NO_DEV_SCAN,
         no_risk_check=WEB_NO_RISK_CHECK,
+        no_name_check=WEB_NO_NAME_CHECK,
+        time_budget=WEB_TIME_BUDGET,
         first_buyers_limit=WEB_FIRST_BUYERS_LIMIT,
         first_buyers_scan_cap=WEB_FIRST_BUYERS_SCAN_CAP,
         dev_scan_cap=WEB_DEV_SCAN_CAP,

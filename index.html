@@ -4,350 +4,243 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FIRSTCALLOOR</title>
-<meta name="description" content="Find the earliest verifiable X mention of a Solana memecoin, anchored to its on-chain creation time.">
+<meta name="description" content="Who called a Solana memecoin first — anchored to the token's real on-chain creation, with the dev, the first buyers and a rug check alongside it.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#07070a; --bg-soft:#0c0d11;
-    --panel:rgba(255,255,255,.035); --panel-solid:#111319; --panel-2:#15171e;
-    --line:rgba(255,255,255,.09); --line-soft:rgba(255,255,255,.06);
-    --text:#f3f1ee; --muted:#9d9aa6; --faint:#68656f;
-    --brand:#ff4d3d; --brand-2:#ff2d6a; --brand-dim:#7a2a22; --brand-glow:rgba(255,77,61,.5);
-    --ok:#2bd97c; --ok-dim:#1a8a4f; --warn:#f5b23e; --bad:#ff5f6d;
-    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
-    --radius:16px;
+    --bg:#0A0B0D;
+    --surface:#131519;
+    --surface-2:#181A1F;
+    --line:#24272E;
+    --line-soft:#1D2026;
+
+    --text:#ECEDEF;
+    --text-2:#9C9FA8;
+    --text-3:#6A6D77;
+
+    --accent:#FF4D4D;
+    --ok:#35D07F;
+    --warn:#F5A623;
+    --bad:#FF5A5F;
+
+    --ok-bg:rgba(53,208,127,.10);
+    --warn-bg:rgba(245,166,35,.10);
+    --bad-bg:rgba(255,90,95,.10);
+
+    --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --r:14px;
   }
   *{box-sizing:border-box}
-  html{background:var(--bg)}
+  html{background:var(--bg); -webkit-text-size-adjust:100%}
   body{
     margin:0; background:var(--bg); color:var(--text);
-    font-family:var(--mono); font-size:15px; line-height:1.6;
-    -webkit-font-smoothing:antialiased; overflow-x:hidden;
+    font-family:var(--sans); font-size:15px; line-height:1.55;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
   }
   a{color:inherit}
-  ::selection{background:var(--brand); color:#1a0503}
+  ::selection{background:rgba(255,77,77,.25)}
 
-  /* ---------- ambient background ---------- */
-  .glow{position:fixed; inset:0; z-index:-1; pointer-events:none; overflow:hidden}
-  .glow::before, .glow::after{
-    content:""; position:absolute; border-radius:50%; filter:blur(10px);
-  }
-  .glow::before{
-    width:900px; height:900px; top:-420px; left:50%; transform:translateX(-38%);
-    background:radial-gradient(circle at 50% 40%, rgba(255,77,61,.35), rgba(255,45,106,.14) 45%, transparent 72%);
-  }
-  .glow::after{
-    width:640px; height:640px; top:120px; right:-260px;
-    background:radial-gradient(circle, rgba(255,77,61,.16), transparent 70%);
-  }
-  .grid-tex{
-    position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.35;
-    background-image:
-      linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
-    background-size:42px 42px;
-    mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 40%, transparent 78%);
-  }
+  .wrap{max-width:760px; margin:0 auto; padding:0 20px 80px}
 
-  .wrap{max-width:900px; margin:0 auto; padding:0 16px 90px}
-
-  /* ---------- nav ---------- */
-  nav.top{
-    position:sticky; top:14px; z-index:20; max-width:900px; margin:14px auto 0;
+  /* ---------- header ---------- */
+  header.top{
+    max-width:760px; margin:0 auto; padding:22px 20px 0;
     display:flex; align-items:center; justify-content:space-between;
-    padding:11px 10px 11px 16px; border-radius:999px;
-    background:rgba(14,15,19,.72); border:1px solid var(--line);
-    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
   }
-  .brandmark{display:flex; align-items:center; gap:9px; font-weight:700; letter-spacing:-.01em; font-size:14.5px}
-  .brandmark .sq{
-    width:20px; height:20px; border-radius:6px; flex:none;
-    background:linear-gradient(135deg, var(--brand), var(--brand-2));
-    box-shadow:0 0 14px var(--brand-glow);
-  }
-  nav.top .navlinks{display:flex; align-items:center; gap:4px}
-  nav.top .navlinks a{
-    font-size:12.5px; color:var(--muted); text-decoration:none; padding:7px 13px;
-    border-radius:999px; transition:color .15s, background .15s;
-  }
-  nav.top .navlinks a:hover{color:var(--text); background:rgba(255,255,255,.06)}
-  .navcta{
-    font-size:12.5px; font-weight:700; color:#1a0503; text-decoration:none;
-    background:linear-gradient(135deg, var(--brand), var(--brand-2));
-    padding:8px 16px; border-radius:999px; white-space:nowrap;
-  }
-  @media (max-width:640px){ nav.top .navlinks{display:none} }
+  .brand{display:flex; align-items:center; gap:9px; font-weight:650; font-size:15px; letter-spacing:-.01em}
+  .brand .dot{width:9px; height:9px; border-radius:50%; background:var(--accent); flex:none}
+  .top a{color:var(--text-3); text-decoration:none; font-size:13.5px; transition:color .15s}
+  .top a:hover{color:var(--text)}
 
   /* ---------- hero ---------- */
-  header.hero{padding:64px 0 8px; text-align:center}
-  .badge{
-    display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted);
-    background:var(--panel); border:1px solid var(--line); padding:7px 14px 7px 11px;
-    border-radius:999px; margin-bottom:22px;
+  .hero{padding:56px 0 6px; text-align:center}
+  h1{
+    font-size:clamp(28px,5vw,38px); line-height:1.15; margin:0 0 12px;
+    letter-spacing:-.025em; font-weight:650;
   }
-  .badge .bdot{width:6px; height:6px; border-radius:50%; background:var(--brand); box-shadow:0 0 8px var(--brand-glow)}
-  h1.h{
-    font-size:clamp(34px,7vw,58px); line-height:1.04; margin:0; letter-spacing:-.03em; font-weight:700;
-  }
-  h1.h .grad{
-    background:linear-gradient(90deg,#fff 5%, var(--brand) 65%, var(--brand-2) 100%);
-    -webkit-background-clip:text; background-clip:text; color:transparent;
-  }
-  .sub{
-    max-width:520px; margin:18px auto 0; color:var(--muted); font-size:14.5px; line-height:1.65;
-  }
+  .hero p{margin:0 auto; max-width:440px; color:var(--text-2); font-size:15px}
 
-  form{
-    display:flex; gap:8px; margin:32px auto 0; max-width:640px; flex-wrap:wrap;
-    background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:6px;
-    backdrop-filter:blur(10px);
-  }
+  form{display:flex; gap:8px; margin:28px 0 0}
   input[type=text]{
-    flex:1 1 320px; min-width:0; background:transparent; border:0;
-    color:var(--text); font-family:var(--mono); font-size:14px;
-    padding:12px 16px; border-radius:999px; outline:none;
+    flex:1; min-width:0; background:var(--surface); border:1px solid var(--line);
+    color:var(--text); font-family:var(--mono); font-size:13.5px;
+    padding:13px 15px; border-radius:11px; outline:none; transition:border-color .15s;
   }
-  input[type=text]::placeholder{color:var(--faint)}
+  input[type=text]::placeholder{color:var(--text-3); font-family:var(--sans); font-size:14.5px}
+  input[type=text]:focus{border-color:#3A3E48}
   button{
-    background:linear-gradient(135deg, var(--brand), var(--brand-2));
-    color:#1a0503; border:0; font-family:var(--mono);
-    font-weight:700; font-size:14px; padding:12px 24px; border-radius:999px; cursor:pointer;
-    box-shadow:0 6px 24px -6px var(--brand-glow);
+    background:var(--accent); color:#fff; border:0; font-family:var(--sans);
+    font-weight:600; font-size:14.5px; padding:13px 22px; border-radius:11px;
+    cursor:pointer; transition:opacity .15s; white-space:nowrap;
   }
-  button:disabled{opacity:.5; cursor:progress; box-shadow:none}
-  .hint{color:var(--faint); font-size:12.5px; text-align:center; margin-top:14px}
+  button:hover{opacity:.9}
+  button:disabled{opacity:.45; cursor:default}
+  .hint{color:var(--text-3); font-size:13px; margin-top:11px; text-align:center}
 
-  .feats{display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:40px}
-  .feat{
-    background:var(--panel); border:1px solid var(--line); border-radius:14px;
-    padding:16px 16px 17px; text-align:left;
+  /* ---------- cards ---------- */
+  #out{margin-top:30px; display:flex; flex-direction:column; gap:14px}
+  .card{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r); padding:20px 22px;
   }
-  .feat .k{font-size:13.5px; font-weight:700; color:var(--text)}
-  .feat .v{font-size:12px; color:var(--faint); margin-top:5px; line-height:1.5}
-  @media (max-width:640px){ .feats{grid-template-columns:1fr} header.hero{padding-top:44px} }
+  .card > h2{
+    font-size:12px; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--text-3); margin:0 0 16px; font-weight:600;
+  }
+  .card.quiet{background:var(--surface-2)}
 
-  /* ---------- result panels (shared with #out) ---------- */
-  #out{margin-top:22px}
-  .panel{
-    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
-    padding:20px 22px; margin-top:14px; backdrop-filter:blur(10px);
-  }
-  .panel h2{
-    font-size:11px; letter-spacing:.14em; text-transform:uppercase;
-    color:var(--muted); margin:0 0 15px; font-weight:600;
-  }
-  .kv{display:grid; grid-template-columns:130px 1fr; gap:7px 14px; font-size:13.5px}
-  .kv dt{color:var(--muted)}
-  .kv dd{margin:0; word-break:break-all}
-  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
-  .muted{color:var(--muted)} .faint{color:var(--faint)}
-  .hero-card{
-    border-color:var(--brand-dim);
-    background:linear-gradient(165deg, rgba(255,77,61,.13), var(--panel) 55%);
-    box-shadow:0 0 0 1px rgba(255,77,61,.08) inset, 0 20px 50px -30px var(--brand-glow);
-  }
-  .hero-card .handle{font-size:27px; font-weight:700; letter-spacing:-.01em}
-  .hero-card .called{
-    display:inline-flex; align-items:center; gap:7px; color:var(--brand);
-    font-size:16.5px; margin-top:6px; font-weight:600;
-  }
-  .hero-card .body{margin-top:13px; color:var(--text); font-size:14px}
-  .hero-card a{color:var(--muted); font-size:12.5px; text-decoration:none; word-break:break-all}
-  .hero-card a:hover{color:var(--brand)}
-  ol.timeline{list-style:none; margin:0; padding:0; counter-reset:r}
-  ol.timeline li{
-    padding:14px 0 14px 42px; border-top:1px solid var(--line-soft); position:relative;
-  }
-  ol.timeline li:first-child{border-top:0}
-  ol.timeline li::before{
-    counter-increment:r; content:counter(r);
-    position:absolute; left:0; top:14px; width:25px; height:25px; border-radius:8px;
-    background:var(--panel-2); color:var(--muted); font-size:12px;
-    display:grid; place-items:center; border:1px solid var(--line-soft);
-  }
-  .row1{display:flex; gap:10px; align-items:baseline; flex-wrap:wrap}
-  .row1 .h{font-weight:700}
-  .row1 .d{margin-left:auto; color:var(--brand); font-size:13px; white-space:nowrap; font-weight:600}
-  .row2{color:var(--muted); font-size:13px; margin-top:4px}
-  .row3{margin-top:4px}
-  .row3 a{color:var(--faint); font-size:12px; text-decoration:none; word-break:break-all}
-  .row3 a:hover{color:var(--brand)}
-  .note{
-    border-left:2px solid var(--warn); background:rgba(245,178,62,.08); padding:11px 14px;
-    margin-top:11px; font-size:13px; color:#f0dcb4; border-radius:0 8px 8px 0;
-  }
-  .note.bad{border-color:var(--bad); background:rgba(255,95,109,.08); color:#f7d0d4}
-  .note.info{border-color:var(--brand); background:rgba(255,77,61,.08); color:#f5cfc9}
-  .note code{background:#00000055; padding:1px 5px; border-radius:4px}
-  .flagrow{
-    display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;
-    padding:9px 0; border-top:1px solid var(--line-soft); font-size:13px;
-  }
-  .flagrow:first-of-type{border-top:0}
-  .flagrow .d{margin-left:auto; white-space:nowrap}
-  .flagrow a{color:var(--faint); text-decoration:none}
-  .flagrow a:hover{color:var(--brand)}
-  pre.err{white-space:pre-wrap; margin:0; font-size:13px; color:#f7d0d4}
-  .spin{display:inline-block; animation:b 1s steps(2) infinite}
-  @keyframes b{50%{opacity:0}}
-  @media (max-width:520px){ .kv{grid-template-columns:1fr} .kv dt{color:var(--faint)} }
-
-  /* ---------- marketing-ish sections below the tool ---------- */
-  section.info{margin-top:96px}
-  .eyebrow{
-    display:inline-flex; align-items:center; gap:7px; font-size:11.5px; color:var(--muted);
-    background:var(--panel); border:1px solid var(--line); padding:6px 13px 6px 10px;
-    border-radius:999px; margin-bottom:18px;
-  }
-  .eyebrow .bdot{width:5px; height:5px; border-radius:50%; background:var(--brand)}
-  .lede{
-    font-size:clamp(19px,3.4vw,26px); line-height:1.55; letter-spacing:-.01em;
-    max-width:680px; color:var(--muted);
-  }
-  .lede b{color:var(--text); font-weight:600}
-  .lede .hl{color:var(--brand); font-weight:600}
-
-  .steps{display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-top:26px}
-  .step{
-    position:relative; background:var(--panel-solid); border:1px solid var(--line);
-    border-radius:18px; padding:22px 22px 20px;
-  }
-  .step .tag{
-    position:absolute; top:20px; right:20px; font-size:11px; color:var(--faint);
-    font-variant-numeric:tabular-nums;
-  }
-  .step h3{margin:0 0 8px; font-size:16.5px; font-weight:700; letter-spacing:-.01em; max-width:80%}
-  .step p{margin:0; color:var(--muted); font-size:13px; line-height:1.6}
-  .pills{display:flex; flex-wrap:wrap; gap:7px; margin-top:14px}
+  /* ---------- summary ---------- */
+  .sum-top{display:flex; align-items:flex-start; gap:14px; flex-wrap:wrap}
+  .sum-top>div{min-width:0}
+  .sum-name{overflow-wrap:anywhere}
+  .sum-name{font-size:26px; font-weight:680; letter-spacing:-.02em; line-height:1.2}
+  .sum-sym{color:var(--text-3); font-weight:500; font-size:16px; margin-left:7px}
+  .sum-meta{color:var(--text-2); font-size:13.5px; margin-top:3px}
   .pill{
-    font-size:11.5px; color:var(--muted); background:rgba(255,255,255,.05);
-    border:1px solid var(--line); padding:5px 11px; border-radius:999px;
+    display:inline-flex; align-items:center; gap:6px; padding:5px 11px;
+    border-radius:999px; font-size:12.5px; font-weight:600; white-space:nowrap;
+    margin-left:auto;
   }
-  @media (max-width:640px){ .steps{grid-template-columns:1fr} }
+  .pill .bulb{width:6px; height:6px; border-radius:50%; background:currentColor}
+  .pill.ok{background:var(--ok-bg); color:var(--ok)}
+  .pill.warn{background:var(--warn-bg); color:var(--warn)}
+  .pill.bad{background:var(--bad-bg); color:var(--bad)}
+  .pill.mute{background:rgba(255,255,255,.05); color:var(--text-3)}
 
-  .quote{
-    margin-top:26px; background:linear-gradient(165deg, rgba(255,77,61,.09), var(--panel-solid) 60%);
-    border:1px solid var(--line); border-radius:18px; padding:28px 30px;
+  .ca{
+    display:flex; align-items:center; gap:8px; margin-top:16px;
+    background:var(--bg); border:1px solid var(--line-soft); border-radius:9px;
+    padding:9px 12px; font-family:var(--mono); font-size:12px; color:var(--text-2);
   }
-  .quote .mark{font-size:34px; color:var(--brand); line-height:1; font-weight:700}
-  .quote p{margin:6px 0 0; font-size:16.5px; line-height:1.55; color:var(--text); max-width:560px}
-  .quote .cap{margin-top:14px; font-size:12.5px; color:var(--faint)}
+  .ca span{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .ca button{
+    background:transparent; color:var(--text-3); border:0; padding:2px 4px;
+    font-size:12px; font-family:var(--sans); cursor:pointer; margin-left:auto;
+  }
+  .ca button:hover{color:var(--text)}
+
+  /* ---------- key/value rows ---------- */
+  .rows{display:flex; flex-direction:column; gap:1px}
+  .row{
+    display:flex; align-items:baseline; gap:14px; padding:11px 0;
+    border-bottom:1px solid var(--line-soft); font-size:14px;
+  }
+  .row:last-child{border-bottom:0; padding-bottom:0}
+  .row:first-child{padding-top:0}
+  .row .k{color:var(--text-2); flex:0 0 172px}
+  .row .v{flex:1; min-width:0; text-align:right; word-break:break-word}
+  .row .sub{display:block; color:var(--text-3); font-size:12.5px; margin-top:2px; font-weight:400}
+  .mono{font-family:var(--mono); font-size:12.5px}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .t2{color:var(--text-2)} .t3{color:var(--text-3)}
+  @media (max-width:560px){
+    .row{flex-direction:column; gap:2px}
+    .row .k{flex:none}
+    .row .v{text-align:left}
+  }
+
+  /* ---------- first call ---------- */
+  .call-head{display:flex; align-items:center; gap:11px; flex-wrap:wrap}
+  .call-handle{font-size:19px; font-weight:650; letter-spacing:-.01em}
+  .call-when{
+    background:var(--ok-bg); color:var(--ok); padding:4px 10px;
+    border-radius:999px; font-size:12.5px; font-weight:600;
+  }
+  .call-body{margin-top:11px; color:var(--text-2); font-size:14px; line-height:1.6; overflow-wrap:anywhere}
+  .call-link{display:inline-block; margin-top:11px; color:var(--text-3); font-size:12.5px; text-decoration:none}
+  .call-link:hover{color:var(--accent)}
+
+  /* ---------- lists ---------- */
+  ol.list, ul.list{list-style:none; margin:0; padding:0}
+  .item{
+    display:flex; gap:13px; padding:13px 0; border-bottom:1px solid var(--line-soft);
+  }
+  .item:last-child{border-bottom:0; padding-bottom:0}
+  .item:first-child{padding-top:0}
+  .idx{
+    flex:none; width:22px; height:22px; border-radius:7px; background:var(--surface-2);
+    color:var(--text-3); font-size:11.5px; font-weight:600;
+    display:grid; place-items:center; margin-top:1px;
+  }
+  .item-main{flex:1; min-width:0}
+  .item-top{display:flex; align-items:baseline; gap:9px; flex-wrap:wrap}
+  .item-top .h{font-weight:600; font-size:14.5px}
+  .item-top .meta{color:var(--text-3); font-size:12.5px}
+  .item-top .when{margin-left:auto; color:var(--accent); font-size:12.5px; font-weight:600; white-space:nowrap}
+  .item-top .when.t3{color:var(--text-3); font-weight:500}
+  .item-top .when.bad{color:var(--bad)}
+  .item-text{color:var(--text-2); font-size:13.5px; margin-top:3px; line-height:1.55; overflow-wrap:anywhere}
+  .item-links{margin-top:4px; font-size:12px}
+  .item-links a{color:var(--text-3); text-decoration:none; margin-right:12px}
+  .item-links a:hover{color:var(--accent)}
+
+  .tag{
+    display:inline-block; padding:2px 7px; border-radius:6px; font-size:11px;
+    font-weight:600; margin-left:6px; vertical-align:middle;
+  }
+  .tag.bad{background:var(--bad-bg); color:var(--bad)}
+  .tag.warn{background:var(--warn-bg); color:var(--warn)}
+
+  /* ---------- notes ---------- */
+  .note{
+    background:var(--surface-2); border-left:2px solid var(--line);
+    border-radius:0 8px 8px 0; padding:10px 13px; margin-top:10px;
+    font-size:13px; color:var(--text-2); line-height:1.55;
+  }
+  .note.warn{border-color:var(--warn); color:#E8D5B5}
+  .note.bad{border-color:var(--bad); color:#F0C9CB}
+  .fine{color:var(--text-3); font-size:12px; margin-top:13px; line-height:1.5}
+  .empty{color:var(--text-3); font-size:14px}
+  pre.err{white-space:pre-wrap; margin:0; font-size:13.5px; color:#F0C9CB; font-family:var(--sans); line-height:1.6}
+
+  .dots::after{content:'…'; animation:d 1.4s steps(4,end) infinite; display:inline-block; width:1em; text-align:left}
+  @keyframes d{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'…'}}
 
   footer.site{
-    margin-top:90px; padding-top:26px; border-top:1px solid var(--line);
-    display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between;
-    color:var(--faint); font-size:12px;
+    max-width:760px; margin:60px auto 0; padding:22px 20px 40px;
+    border-top:1px solid var(--line-soft);
+    display:flex; gap:14px; justify-content:space-between; flex-wrap:wrap;
+    color:var(--text-3); font-size:12.5px;
   }
-  footer.site .flinks{display:flex; gap:16px}
-  footer.site a{color:var(--muted); text-decoration:none}
-  footer.site a:hover{color:var(--brand)}
+  footer.site a{color:var(--text-3); text-decoration:none}
+  footer.site a:hover{color:var(--text)}
 </style>
 </head>
 <body>
-<div class="glow"></div>
-<div class="grid-tex"></div>
 
-<nav class="top">
-  <div class="brandmark"><span class="sq"></span>FIRSTCALLOOR</div>
-  <div class="navlinks">
-    <a href="#how">How it works</a>
-    <a href="#pipeline">Pipeline</a>
-  </div>
-  <a class="navcta" href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">Source</a>
-</nav>
+<header class="top">
+  <div class="brand"><span class="dot"></span>FIRSTCALLOOR</div>
+  <a href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">Source</a>
+</header>
 
 <div class="wrap">
-
-  <header class="hero">
-    <span class="badge"><span class="bdot"></span>On-chain verified, not self-reported</span>
-    <h1 class="h">Who called it <span class="grad">first</span>?</h1>
-    <p class="sub">Paste a Solana contract address. FIRSTCALLOOR anchors the token's real
-      on-chain birth, searches X for who mentioned it, and ranks the earliest
-      genuine call &mdash; with proof.</p>
+  <section class="hero">
+    <h1>Who called it first?</h1>
+    <p>Paste a Solana contract address. Get the first genuine mention on X, the
+       first buyers, the dev's history, and a rug check — all anchored to the
+       token's real on-chain creation.</p>
 
     <form id="f">
       <input id="ca" type="text" spellcheck="false" autocomplete="off"
-             placeholder="Paste a Solana contract address (not a ticker)">
+             placeholder="Solana contract address">
       <button id="go" type="submit">Trace</button>
     </form>
-    <div class="hint">Tickers are rejected on purpose &mdash; they collide, and a wrong &ldquo;first call&rdquo; is worse than none.</div>
-
-    <div class="feats">
-      <div class="feat"><div class="k">On-chain zero point</div>
-        <div class="v">Genesis transaction pulled straight from Solana RPC, never trusted from an API's self-reported field.</div></div>
-      <div class="feat"><div class="k">Exact CA, never the ticker</div>
-        <div class="v">Tickers collide across dozens of tokens. Only the 44-char mint address is searched.</div></div>
-      <div class="feat"><div class="k">Bots flagged, not hidden</div>
-        <div class="v">Accounts under 24h old are surfaced separately &mdash; never silently folded into the ranking.</div></div>
-    </div>
-  </header>
+    <div class="hint">Needs the contract address, not the ticker — tickers collide across tokens.</div>
+  </section>
 
   <div id="out"></div>
-
-  <section class="info" id="how">
-    <span class="eyebrow"><span class="bdot"></span>How it works</span>
-    <p class="lede">Every timeline starts from the token's <span class="hl">real on-chain birth</span>,
-      never a third-party's self-reported timestamp. From there, FIRSTCALLOOR searches for the
-      <b>exact contract address</b> &mdash; not the ticker &mdash; and <span class="hl">filters out
-      recycled CAs, retweets, and bot accounts</span> before anyone gets ranked as first.</p>
-  </section>
-
-  <section class="info" id="pipeline">
-    <span class="eyebrow"><span class="bdot"></span>Under the hood</span>
-    <p class="lede" style="max-width:520px">Four steps, no guessing.</p>
-    <div class="steps">
-      <div class="step">
-        <span class="tag">01</span>
-        <h3>On-chain origin</h3>
-        <p>Signature history is paginated back to the mint's genesis transaction on Solana.</p>
-        <div class="pills">
-          <span class="pill">getSignaturesForAddress</span>
-          <span class="pill">getTransaction</span>
-        </div>
-      </div>
-      <div class="step">
-        <span class="tag">02</span>
-        <h3>Provider search</h3>
-        <p>The exact CA string is searched for mentions, windowed outward from launch to control cost.</p>
-        <div class="pills">
-          <span class="pill">twitterapi.io</span>
-          <span class="pill">X API v2</span>
-        </div>
-      </div>
-      <div class="step">
-        <span class="tag">03</span>
-        <h3>Triage &amp; filtering</h3>
-        <p>Pre-launch mentions, retweets, and fresh accounts are pulled out and shown separately.</p>
-        <div class="pills">
-          <span class="pill">recycled CAs</span>
-          <span class="pill">bot accounts</span>
-        </div>
-      </div>
-      <div class="step">
-        <span class="tag">04</span>
-        <h3>Ranked timeline</h3>
-        <p>What's left is ranked earliest-first, each entry carrying a link, handle, and timestamp.</p>
-        <div class="pills">
-          <span class="pill">proof, not guesses</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="quote">
-      <div class="mark">&ldquo;</div>
-      <p>A wrong &ldquo;first call&rdquo; is worse than no call &mdash; so if it can't be verified,
-        it isn't ranked.</p>
-      <div class="cap">&mdash; FIRSTCALLOOR design principle</div>
-    </div>
-  </section>
-
-  <footer class="site">
-    <div>on-chain zero point via Solana RPC &middot; mentions via twitterapi.io / X API v2</div>
-    <div class="flinks">
-      <a href="https://x.com/fwteevincs" target="_blank" rel="noopener">@fwteevincs</a>
-      <a href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">source</a>
-    </div>
-  </footer>
 </div>
+
+<footer class="site">
+  <span>On-chain data via Solana RPC · mentions via twitterapi.io / X API</span>
+  <span>
+    <a href="https://x.com/fwteevincs" target="_blank" rel="noopener">@fwteevincs</a> &nbsp;
+    <a href="https://github.com/TeevincsCrypt/firstcalloor" target="_blank" rel="noopener">source</a>
+  </span>
+</footer>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -359,240 +252,392 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m =>
 const fmtNum = (n) => n == null ? "?" :
   n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
 
-function panel(title, inner, cls = "") {
-  return `<section class="panel ${cls}"><h2>${title}</h2>${inner}</section>`;
+const fmtAmount = (n) => n == null ? "?" : Number(n).toLocaleString(undefined, {maximumFractionDigits:0});
+
+function timeAgo(iso) {
+  if (!iso) return "";
+  const then = Date.parse(iso);
+  if (isNaN(then)) return "";
+  const s = Math.max(0, (Date.now() - then) / 1000);
+  if (s < 90) return "just now";
+  if (s < 3600) return Math.round(s/60) + "m ago";
+  if (s < 86400) return Math.round(s/3600) + "h ago";
+  return Math.round(s/86400) + "d ago";
 }
 
+/* A raw ISO string is precise but not readable at a glance, and this page's
+   whole job is to be read at a glance. The exact timestamp stays available
+   on hover, where precision actually gets checked. */
+function fmtDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+function dateCell(iso, cls = "") {
+  if (!iso) return `<span class="when t3">unknown</span>`;
+  const ago = timeAgo(iso);
+  return `<span class="when ${cls}" title="${esc(iso)}">${esc(fmtDate(iso))}${
+    ago ? ` · ${ago}` : ""}</span>`;
+}
+
+const shorten = (a, head = 4, tail = 4) =>
+  !a ? "?" : (a.length <= head + tail + 1 ? a : `${a.slice(0, head)}…${a.slice(-tail)}`);
+
+function card(title, inner, cls = "") {
+  return `<section class="card ${cls}">${title ? `<h2>${title}</h2>` : ""}${inner}</section>`;
+}
+function row(k, v, sub) {
+  return `<div class="row"><div class="k">${k}</div><div class="v">${v}${
+    sub ? `<span class="sub">${sub}</span>` : ""}</div></div>`;
+}
 function notes(list, cls = "") {
   return (list || []).map(n => `<div class="note ${cls}">${esc(n)}</div>`).join("");
 }
 
-function renderToken(d) {
-  const o = d.origin, c = d.cross_check;
-  const name = d.token.name ? `${esc(d.token.name)} ($${esc(d.token.symbol)})`
-                            : `<span class="faint">not resolved</span>`;
-  let xc;
-  if (c.status === "agree")
-    xc = `<span class="ok">pump.fun agrees</span> <span class="faint">(&Delta; ${c.delta_seconds}s)</span>`;
-  else if (c.status === "disagree")
-    xc = `<span class="warn">pump.fun disagrees by ${c.delta_seconds}s</span>
-          <span class="faint">&mdash; it says ${esc(c.reported_at)}. The on-chain time is what we trust.</span>`;
-  else
-    xc = `<span class="faint">unavailable &mdash; ${esc(c.detail || "no data")}</span>`;
+/* ---------------- summary ---------------- */
 
+const VERDICT = {
+  elevated_risk:     { cls:"bad",  label:"Elevated risk" },
+  some_risk_signals: { cls:"warn", label:"Some risk signals" },
+  no_major_red_flags:{ cls:"ok",   label:"No major red flags" },
+  unknown:           { cls:"mute", label:"Risk unknown" },
+};
+
+function renderSummary(d) {
+  const o = d.origin, t = d.token || {};
+  const name = t.name || null, sym = t.symbol || null;
+  const v = d.risk ? (VERDICT[d.risk.verdict] || VERDICT.unknown) : null;
+
+  const title = name
+    ? `${esc(name)}${sym ? `<span class="sum-sym">$${esc(sym)}</span>` : ""}`
+    : (sym ? `$${esc(sym)}` : `<span class="t3">Unnamed token</span>`);
+
+  const age = timeAgo(o.created_at);
   const genesis = o.reached_genesis
-    ? `<span class="ok">reached genesis</span>`
-    : `<span class="warn">capped &mdash; may not be genesis</span>`;
+    ? `<span class="ok">verified on-chain</span>`
+    : `<span class="warn">history capped — creation time may not be exact</span>`;
 
-  return panel("Token", `
-    <dl class="kv">
-      <dt>Contract</dt><dd>${esc(d.input.contract_address)}</dd>
-      <dt>Name</dt><dd>${name}</dd>
-      <dt>Created</dt><dd><span class="ok">${esc(o.created_at)}</span>
-        <span class="faint">&larr; zero point, on-chain</span></dd>
-      <dt>Genesis tx</dt><dd class="faint">${esc(o.genesis_signature)}</dd>
-      <dt>History</dt><dd>${o.signatures_scanned.toLocaleString()} txs over
-        ${o.pages_scanned} page(s) &middot; ${genesis}</dd>
-      <dt>Cross-check</dt><dd>${xc}</dd>
-    </dl>
-    ${notes(o.warnings)}
+  return card("", `
+    <div class="sum-top">
+      <div>
+        <div class="sum-name">${title}</div>
+        <div class="sum-meta" title="${esc(o.created_at || "")}">Created ${
+    esc(fmtDate(o.created_at))}${age ? ` · ${age}` : ""}</div>
+      </div>
+      ${v ? `<span class="pill ${v.cls}"><span class="bulb"></span>${v.label}</span>` : ""}
+    </div>
+    <div class="ca">
+      <span class="mono">${esc(d.input.contract_address)}</span>
+      <button type="button" data-copy="${esc(d.input.contract_address)}">Copy</button>
+    </div>
+    <div class="fine">Creation time taken from the mint's own genesis transaction — ${genesis}.</div>
   `);
 }
 
-const VERDICT_LABEL = {
-  elevated_risk: `<span class="bad">ELEVATED RISK</span>`,
-  some_risk_signals: `<span class="warn">some risk signals</span>`,
-  no_major_red_flags: `<span class="ok">no major red flags</span>`,
-  unknown: `<span class="faint">unknown &mdash; not enough data</span>`,
-};
+/* ---------------- risk ---------------- */
 
 function renderRisk(d) {
   const r = d.risk;
   if (!r) return "";
   const rows = [];
+
   if (r.mint_authority_revoked !== null) {
-    rows.push(`<dt>Mint authority</dt><dd>${r.mint_authority_revoked
-      ? '<span class="ok">revoked</span>' : '<span class="bad">STILL ACTIVE</span>'}</dd>`);
-    rows.push(`<dt>Freeze authority</dt><dd>${r.freeze_authority_revoked
-      ? '<span class="ok">revoked</span>' : '<span class="bad">STILL ACTIVE</span>'}</dd>`);
+    rows.push(row("Can the dev mint more?",
+      r.mint_authority_revoked ? `<span class="ok">No</span>` : `<span class="bad">Yes</span>`,
+      r.mint_authority_revoked ? "Mint authority revoked" : "Mint authority still active — supply can be inflated"));
+    rows.push(row("Can the dev freeze sells?",
+      r.freeze_authority_revoked ? `<span class="ok">No</span>` : `<span class="bad">Yes</span>`,
+      r.freeze_authority_revoked ? "Freeze authority revoked" : "Freeze authority still active — holders can be locked"));
   }
   if (r.top10_holder_pct !== null) {
-    rows.push(`<dt>Top 10 holders</dt><dd>${r.top10_holder_pct}% of supply</dd>`);
+    const p = r.top10_holder_pct;
+    const cls = p > 70 ? "bad" : p > 40 ? "warn" : "ok";
+    rows.push(row("Top 10 wallets hold", `<span class="${cls}">${p}%</span>`, "of total supply"));
   }
-  if (r.dev_other_launches) {
-    rows.push(`<dt>Dev launches</dt><dd>${r.dev_other_launches} other token(s) found</dd>`);
+  if (d.migration && d.migration.migrated) {
+    rows.push(row("Trading on", `<span class="ok">${esc(d.migration.venue)}</span>`, "Graduated from the bonding curve"));
   }
-  const mig = d.migration;
-  if (mig && mig.migrated) {
-    rows.push(`<dt>Migration</dt><dd><span class="ok">migrated</span> to ${esc(mig.venue)}</dd>`);
-  }
-  return panel("Risk signal", `
-    <div style="margin-bottom:12px; font-size:15px; font-weight:700">${VERDICT_LABEL[r.verdict] || esc(r.verdict)}</div>
-    ${rows.length ? `<dl class="kv">${rows.join("")}</dl>` : ""}
-    ${r.reasons.map(x => `<div class="note">${esc(x)}</div>`).join("")}
+
+  // The verdict pill already sits in the summary card directly above this
+  // one; repeating it here just made the same badge appear twice on screen.
+  return card("Rug check", `
+    ${rows.length ? `<div class="rows">${rows.join("")}</div>` : ""}
+    ${r.reasons.map(x => `<div class="note warn">${esc(x)}</div>`).join("")}
     ${notes(r.notes)}
-    <div class="faint" style="margin-top:12px; font-size:11.5px">${esc(r.disclaimer)}</div>
+    <div class="fine">${esc(r.disclaimer)}</div>
   `);
 }
 
-function renderFirstBuyers(d) {
-  const fb = d.first_buyers;
-  if (!fb) return "";
-  const wallets = fb.wallets;
-  let inner;
-  if (fb.skipped) {
-    inner = `<div class="warn">Detection did not run.</div>
-              <div class="faint">See the note below; this is not the same as checking and finding none.</div>`;
-  } else if (wallets.length) {
-    inner = `
-    <ol class="timeline">${wallets.map(b => `
-      <li>
-        <div class="row1">
-          <span class="h">${esc(b.wallet.slice(0,4))}&hellip;${esc(b.wallet.slice(-4))}</span>
-          <span class="faint">${b.sol_spent_approx != null ? '~' + b.sol_spent_approx + ' SOL' : ''}</span>
-          <span class="d">+${esc(b.time_since_creation || '?')}</span>
-        </div>
-        <div class="row3">
-          <a href="${esc(b.wallet_url)}" target="_blank" rel="noopener">wallet</a> &middot;
-          <a href="${esc(b.explorer_url)}" target="_blank" rel="noopener">tx</a>
-        </div>
-      </li>`).join("")}</ol>`;
-  } else {
-    inner = `<div class="faint">none detected in the transactions checked</div>`;
-  }
-  return panel(`First buyers (${wallets.length})`, inner + notes(fb.notes));
-}
+/* ---------------- first call ---------------- */
 
-function renderDevProfile(d) {
-  const dev = d.dev_profile;
-  if (!dev || !dev.dev_wallet) return "";
-  const launches = dev.other_launches;
-  return panel("Dev wallet", `
-    <dl class="kv">
-      <dt>Wallet</dt><dd><a href="${esc(dev.wallet_url)}" target="_blank" rel="noopener">${esc(dev.dev_wallet)}</a></dd>
-      <dt>History</dt><dd>${dev.is_serial_deployer
-        ? `<span class="warn">${dev.other_launches_found} other launch(es) found</span>`
-        : '<span class="ok">no other launches found</span>'}
-        <span class="faint">(checked last ${dev.signatures_scanned} txs)</span></dd>
-    </dl>
-    ${launches.length ? `<div style="margin-top:10px">${launches.map(l => `
-      <div class="flagrow"><span>${esc(l.mint.slice(0,8))}&hellip;</span>
-        <span class="faint">${esc(l.created_at || '?')}</span>
-        <span class="d"><a href="${esc(l.pump_fun_url)}" target="_blank" rel="noopener">view</a></span>
-      </div>`).join("")}</div>` : ""}
-    ${notes(dev.notes)}
-  `);
-}
-
-const PROVIDER_LABEL = { "x": "X API v2", "twitterapi.io": "twitterapi.io", "mock": "mock fixtures" };
-
-function insiderBadge(m) {
+function insiderTag(m) {
   return m.matched_buyer_wallet
-    ? ` <span class="bad" title="This tweet contains a wallet address that was also a first buyer">&#9888; posted own buy wallet</span>`
+    ? `<span class="tag bad" title="This tweet contains a wallet that also bought in the first buys">also a first buyer</span>`
     : "";
 }
 
 function renderFirstCall(d) {
-  const s = d.search;
-  const providerLabel = PROVIDER_LABEL[s.provider] || s.provider || null;
-  if (!d.first_call) {
-    const searchRan = !["no_credentials","forbidden","error"].includes(s.status);
-    const head = searchRan
-      ? `<div class="warn">No public mentions found.</div>` +
-        (s.complete ? "" : `<div class="faint">The search was incomplete, so this is not proof of absence.</div>`)
-      : `<div class="warn">Mention search did not run.</div>
-         <div class="faint">The on-chain zero point above is still real.</div>`;
-    return panel("First call", head + notes(s.notes, searchRan ? "" : "info"));
+  const s = d.search, f = d.first_call;
+  if (!f) {
+    const ran = !["no_credentials","forbidden","error"].includes(s.status);
+    return card("First call", `
+      <div class="empty">${ran ? "No public mentions found." : "Mention search didn't run."}</div>
+      ${!ran ? `<div class="fine">Everything on-chain above is still accurate.</div>` : ""}
+      ${notes(s.notes)}
+    `);
   }
-  const f = d.first_call;
-  return panel("First call", `
-    <div class="handle">@${esc(f.handle)}</div>
-    <div class="muted">${fmtNum(f.followers_at_query_time)} followers at query time</div>
-    <div class="called">Called ${esc(f.time_since_creation)} after launch
-      <span class="faint">&middot; ${esc(f.tweeted_at)}</span></div>
-    <div class="body">${esc(f.text)}</div>
-    <div style="margin-top:10px"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a></div>
-  `, "hero-card") + panel("Search", `
-    <dl class="kv">
-      ${providerLabel ? `<dt>Provider</dt><dd>${esc(providerLabel)}</dd>` : ""}
-      <dt>Query</dt><dd>${esc(s.query)} <span class="faint">(exact CA, never the ticker)</span></dd>
-      <dt>Window</dt><dd class="muted">${esc(s.window_start)} &rarr; ${esc(s.window_end)}</dd>
-      <dt>Coverage</dt><dd>${s.complete ? '<span class="ok">complete</span>'
-                                        : '<span class="warn">incomplete</span>'}</dd>
-    </dl>${notes(s.notes)}`);
+  return card("First call", `
+    <div class="call-head">
+      <span class="call-handle">@${esc(f.handle)}</span>
+      <span class="t3" style="font-size:13px">${fmtNum(f.followers_at_query_time)} followers</span>
+      <span class="call-when">${esc(f.time_since_creation)} after launch</span>
+    </div>
+    <div class="call-body">${esc(f.text)}${insiderTag(f)}</div>
+    <a class="call-link" href="${esc(f.url)}" target="_blank" rel="noopener">View on X ↗</a>
+  `);
 }
 
 function renderTimeline(d) {
   if (!d.timeline.length) return "";
   const items = d.timeline.map(m => `
-    <li>
-      <div class="row1">
-        <span class="h">@${esc(m.handle)}</span>
-        <span class="faint">${fmtNum(m.followers_at_query_time)}</span>
-        <span class="d">+${esc(m.time_since_creation)}</span>
+    <li class="item">
+      <div class="item-main">
+        <div class="item-top">
+          <span class="h">@${esc(m.handle)}</span>
+          <span class="meta">${fmtNum(m.followers_at_query_time)}</span>
+          <span class="when">+${esc(m.time_since_creation)}</span>
+        </div>
+        <div class="item-text">${esc(m.text)}${insiderTag(m)}</div>
+        <div class="item-links"><a href="${esc(m.url)}" target="_blank" rel="noopener">View ↗</a></div>
       </div>
-      <div class="row2">${esc(m.text)}${insiderBadge(m)}</div>
-      <div class="row3"><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.tweeted_at)} &middot; ${esc(m.url)}</a></div>
     </li>`).join("");
-  return panel(`Timeline &mdash; earliest ${d.timeline.length} genuine mentions`,
-               `<ol class="timeline">${items}</ol>`);
+  return card(`Earliest mentions (${d.timeline.length})`, `<ol class="list">${items}</ol>`);
 }
+
+/* ---------------- first buyers ---------------- */
+
+function renderFirstBuyers(d) {
+  const fb = d.first_buyers;
+  if (!fb) return "";
+  if (fb.skipped) {
+    return card("First buyers", `
+      <div class="empty">Couldn't check.</div>
+      ${notes(fb.notes)}
+    `);
+  }
+  if (!fb.wallets.length) {
+    return card("First buyers", `<div class="empty">No buys found right after launch.</div>${notes(fb.notes)}`);
+  }
+  const items = fb.wallets.map((b, i) => `
+    <li class="item">
+      <div class="idx">${i + 1}</div>
+      <div class="item-main">
+        <div class="item-top">
+          <span class="h mono">${esc(shorten(b.wallet, 6, 6))}</span>
+          <span class="meta">${b.sol_spent_approx != null ? `~${b.sol_spent_approx} SOL` : ""}</span>
+          <span class="when">+${esc(b.time_since_creation || "?")}</span>
+        </div>
+        <div class="item-links">
+          <a href="${esc(b.wallet_url)}" target="_blank" rel="noopener">Wallet ↗</a>
+          <a href="${esc(b.explorer_url)}" target="_blank" rel="noopener">Transaction ↗</a>
+        </div>
+      </div>
+    </li>`).join("");
+  return card(`First buyers (${fb.wallets.length})`,
+    `<ol class="list">${items}</ol>${notes(fb.notes)}`);
+}
+
+/* ---------------- dev ---------------- */
+
+function renderDev(d) {
+  const dev = d.dev_profile;
+  if (!dev || !dev.dev_wallet) return "";
+
+  const rows = [];
+  rows.push(row("Wallet",
+    `<a class="mono" href="${esc(dev.wallet_url)}" target="_blank" rel="noopener">${esc(shorten(dev.dev_wallet, 6, 6))} ↗</a>`,
+    "Paid for the token's creation transaction"));
+
+  if (dev.holding_known) {
+    const p = dev.holding_pct;
+    let val, sub;
+    if (p == null) { val = `${fmtAmount(dev.holding_amount)}`; sub = "tokens"; }
+    else if (p >= 20) { val = `<span class="bad">${p}%</span>`; sub = `${fmtAmount(dev.holding_amount)} tokens — a large share`; }
+    else if (p >= 5)  { val = `<span class="warn">${p}%</span>`; sub = `${fmtAmount(dev.holding_amount)} tokens`; }
+    else if (p > 0)   { val = `<span class="ok">${p}%</span>`; sub = `${fmtAmount(dev.holding_amount)} tokens`; }
+    else              { val = `<span class="ok">0%</span>`; sub = "Dev holds none of it now"; }
+    rows.push(row("Still holds", val, sub));
+  } else {
+    rows.push(row("Still holds", `<span class="t3">Unknown</span>`, "Balance lookup didn't complete"));
+  }
+
+  // An empty list from a scan that never ran is not "none found" - saying so
+  // would turn a missing check into a clean bill of health.
+  rows.push(dev.scan_ran === false
+    ? row("Other tokens launched", `<span class="t3">Not checked</span>`,
+          "The dev's launch history wasn't scanned on this run")
+    : row("Other tokens launched",
+        dev.is_serial_deployer
+          ? `<span class="warn">${dev.other_launches_found}</span>`
+          : `<span class="ok">None found</span>`,
+        `From this wallet's last ${dev.signatures_scanned} transactions`));
+
+  const launches = dev.other_launches.length ? `
+    <div style="margin-top:14px"><ul class="list">${dev.other_launches.map(l => `
+      <li class="item">
+        <div class="item-main">
+          <div class="item-top">
+            <span class="h mono">${esc(shorten(l.mint, 6, 6))}</span>
+            ${dateCell(l.created_at, "t3")}
+          </div>
+          <div class="item-links"><a href="${esc(l.pump_fun_url)}" target="_blank" rel="noopener">View token ↗</a></div>
+        </div>
+      </li>`).join("")}</ul></div>` : "";
+
+  return card("Dev wallet", `<div class="rows">${rows.join("")}</div>${launches}${notes(dev.notes)}`);
+}
+
+/* ---------------- name collisions ---------------- */
+
+function renderNameCheck(d) {
+  const nc = d.name_collisions;
+  if (!nc) return "";
+  if (nc.status === "unavailable")
+    return card("Name check", `<div class="empty">Couldn't check right now.</div><div class="fine">${esc(nc.detail || "")}</div>`);
+  if (nc.status === "skipped") return "";
+
+  if (!nc.count)
+    return card("Name check", `<div class="empty"><span class="ok">No other Solana token is using this name.</span></div>`);
+
+  const oldest = nc.oldest;
+  const rest = (nc.twins || []).filter(t => !oldest || t.mint !== oldest.mint).slice(0, 5);
+  return card(`Name check (${nc.count} other token${nc.count === 1 ? "" : "s"} with this name)`, `
+    ${oldest ? `
+      <div class="note warn">An older token already uses the name
+        <strong>${esc(oldest.name || nc.searched_name)}</strong> — first traded
+        <span title="${esc(oldest.first_pair_seen || "")}">${esc(fmtDate(oldest.first_pair_seen) || "at an unknown date")}</span>${
+          timeAgo(oldest.first_pair_seen) ? ` (${timeAgo(oldest.first_pair_seen)})` : ""}.</div>` : ""}
+    <ul class="list" style="margin-top:12px">
+      ${(oldest ? [oldest, ...rest] : rest).map(t => `
+        <li class="item">
+          <div class="item-main">
+            <div class="item-top">
+              <span class="h mono">${esc(shorten(t.mint, 6, 6))}</span>
+              <span class="meta">${esc(t.symbol ? "$" + t.symbol : "")}</span>
+              ${dateCell(t.first_pair_seen, "t3")}
+            </div>
+            <div class="item-links"><a href="${esc(t.chart_url)}" target="_blank" rel="noopener">Chart ↗</a></div>
+          </div>
+        </li>`).join("")}
+    </ul>
+    <div class="fine">${esc(nc.caveat)}</div>
+  `);
+}
+
+/* ---------------- filtered ---------------- */
 
 function renderFlagged(d) {
   let html = "";
   const bots = d.possible_bot_mentions || [];
   if (bots.length) {
-    html += panel(`Possible bot mentions (${bots.length})`, `
-      <div class="faint" style="margin-bottom:10px">Accounts created in the last 24h.
-        Surfaced, never ranked &mdash; usually a bot, occasionally a real early caller.</div>
-      ${bots.map(m => `<div class="flagrow">
-          <span class="warn">~</span><span>@${esc(m.handle)}</span>
-          <span class="faint">${m.account_age_hours?.toFixed(1) ?? "?"}h old</span>
-          <span class="d"><a href="${esc(m.url)}" target="_blank" rel="noopener">+${esc(m.time_since_creation)}</a></span>
-        </div>`).join("")}`);
+    html += card(`Possible bots (${bots.length})`, `
+      <div class="fine" style="margin:0 0 12px">Accounts under 24h old. Shown separately, never ranked.</div>
+      <ul class="list">${bots.map(m => `
+        <li class="item">
+          <div class="item-main">
+            <div class="item-top">
+              <span class="h">@${esc(m.handle)}</span>
+              <span class="meta">${m.account_age_hours?.toFixed(0) ?? "?"}h old account</span>
+              <span class="when t3">+${esc(m.time_since_creation)}</span>
+            </div>
+            <div class="item-links"><a href="${esc(m.url)}" target="_blank" rel="noopener">View ↗</a></div>
+          </div>
+        </li>`).join("")}</ul>`, "quiet");
   }
+
   const pre = d.filtered?.pre_creation || [];
   if (pre.length) {
-    html += panel(`Filtered &mdash; posted before the token existed (${pre.length})`, `
-      <div class="faint" style="margin-bottom:10px">Timestamped before the mint existed on-chain,
-        so they cannot be calls on it: a recycled or impersonated CA, a scraper reposting old
-        text, or clock skew. Excluded from the ranking by design.</div>
-      ${pre.map(m => `<div class="flagrow">
-          <span class="bad">&times;</span><span>@${esc(m.handle)}</span>
-          <span class="faint">${esc(m.tweeted_at)}</span>
-          <span class="d"><a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.time_since_creation)}</a></span>
-        </div>`).join("")}`);
+    html += card(`Posted before the token existed (${pre.length})`, `
+      <div class="fine" style="margin:0 0 12px">Timestamped before this mint existed on-chain, so they can't be calls on it —
+        a recycled contract address, a scraper reposting old text, or clock skew. Excluded from the ranking.</div>
+      <ul class="list">${pre.map(m => `
+        <li class="item">
+          <div class="item-main">
+            <div class="item-top">
+              <span class="h">@${esc(m.handle)}</span>
+              <span class="when bad">${esc(m.time_since_creation)}</span>
+            </div>
+            <div class="item-links"><a href="${esc(m.url)}" target="_blank" rel="noopener">View ↗</a></div>
+          </div>
+        </li>`).join("")}</ul>`, "quiet");
   }
+
   const rt = (d.filtered?.retweets || []).length, qt = (d.filtered?.quote_tweets || []).length;
   if (rt + qt) {
-    html += panel(`Filtered &mdash; amplification (${rt + qt})`,
-      `<div class="faint">${rt} retweet(s) and ${qt} quote tweet(s) excluded as non-original.</div>`);
+    html += card("Excluded as amplification", `
+      <div class="empty">${rt} retweet${rt === 1 ? "" : "s"} and ${qt} quote tweet${qt === 1 ? "" : "s"} left out as non-original.</div>`, "quiet");
   }
   return html;
 }
 
+/* ---------------- search detail ---------------- */
+
+const PROVIDER = { "x":"X API v2", "twitterapi.io":"twitterapi.io", "mock":"mock fixtures" };
+
+function renderSearchDetail(d) {
+  const s = d.search;
+  if (!s.provider && s.status === "no_credentials") return "";
+  return card("Search detail", `<div class="rows">
+    ${row("Provider", esc(PROVIDER[s.provider] || s.provider || "—"))}
+    ${row("Searched for", `<span class="mono">${esc(s.query)}</span>`, "The exact contract address, never the ticker")}
+    ${row("Coverage", s.complete
+        ? `<span class="ok">Complete</span>`
+        : `<span class="warn">Incomplete</span>`,
+        s.complete ? "" : "Results below may be missing earlier mentions")}
+  </div>${notes(s.notes)}`, "quiet");
+}
+
+/* ---------------- run ---------------- */
+
 async function run(ca) {
   btn.disabled = true;
-  out.innerHTML = panel("Working",
-    `<div class="muted">Walking the mint's signature history back to genesis<span class="spin">_</span></div>
-     <div class="faint" style="margin-top:6px">Busy tokens take a few seconds.</div>`);
+  out.innerHTML = card("", `<div class="empty"><span class="dots">Reading the chain</span></div>
+    <div class="fine">Walking the token's history back to its first transaction.</div>`);
   try {
     const res = await fetch(`/api/analyze?ca=${encodeURIComponent(ca)}`);
     const data = await res.json();
     if (!res.ok && res.status !== 206) {
-      out.innerHTML = panel("Cannot trace this",
-        `<pre class="err">${esc(data.message || "Unknown error")}</pre>`);
+      out.innerHTML = card("Can't trace this", `<pre class="err">${esc(data.message || "Unknown error")}</pre>`);
       return;
     }
-    out.innerHTML = renderToken(data) + renderRisk(data) + renderFirstBuyers(data)
-                  + renderDevProfile(data) + renderFirstCall(data)
-                  + renderTimeline(data) + renderFlagged(data);
+    out.innerHTML =
+      renderSummary(data) +
+      renderRisk(data) +
+      renderFirstCall(data) +
+      renderTimeline(data) +
+      renderFirstBuyers(data) +
+      renderDev(data) +
+      renderNameCheck(data) +
+      renderFlagged(data) +
+      renderSearchDetail(data);
   } catch (e) {
-    out.innerHTML = panel("Request failed", `<pre class="err">${esc(e.message)}</pre>`);
+    out.innerHTML = card("Request failed", `<pre class="err">${esc(e.message)}</pre>`);
   } finally {
     btn.disabled = false;
   }
 }
+
+out.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-copy]");
+  if (!b) return;
+  try {
+    await navigator.clipboard.writeText(b.dataset.copy);
+    const old = b.textContent;
+    b.textContent = "Copied";
+    setTimeout(() => { b.textContent = old; }, 1200);
+  } catch { /* clipboard blocked; nothing useful to do */ }
+});
 
 form.addEventListener("submit", (e) => {
   e.preventDefault();

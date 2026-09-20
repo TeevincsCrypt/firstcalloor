@@ -17,6 +17,8 @@ Stdlib only - no pip install required.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import random
@@ -61,6 +63,75 @@ MAX_RETRIES = 4
 # serverless function's hard wall clock.
 DEFAULT_FIRST_BUYERS_LIMIT = 10
 DEFAULT_FIRST_BUYERS_SCAN_CAP = 20
+# --------------------------------------------------------------------------
+# wall-clock budget
+# --------------------------------------------------------------------------
+#
+# The serverless path has a hard 10s wall, and overrunning it is not a slow
+# response - the platform kills the process mid-flight and the browser gets
+# an opaque crash page instead of anything this code would have said. The
+# HttpBudget above bounds any ONE request; this bounds the run as a whole,
+# which is a different failure: a dozen individually-fine RPC calls against
+# a slow endpoint still add up past the wall.
+#
+# It matters most because the on-chain extras (first buyers, dev history,
+# rug signal) run BEFORE the mention search, so without a guard the bonus
+# context can eat the budget and the actual answer - who called it first -
+# never gets to run at all. Each extra therefore has to show it can afford
+# itself AND leave the search its reserve, or it stands down and says so.
+# Skipped-for-time is reported as exactly that, never as "found nothing".
+
+# Rough per-phase costs in seconds, sized from observed behaviour against a
+# slow public RPC (~0.6s per getTransaction) rather than a fast paid one -
+# budgeting for the good case is how you overrun the wall in the bad one.
+COST_FIRST_BUYERS = 3.0
+COST_DEV_SCAN = 3.5
+COST_RISK_CHECK = 1.0
+COST_DEV_HOLDING = 0.6
+COST_NAME_CHECK = 1.0
+# What the mention search itself needs: one to three HTTP calls with pacing
+# between them. This is the reserve every optional phase must leave behind.
+SEARCH_RESERVE = 4.0
+
+
+class TimeBudget:
+    """Wall-clock guard for a single run. A limit of None means unlimited,
+    which is the CLI's case - a human at a terminal can wait out a slow
+    endpoint, a serverless function cannot.
+    """
+
+    def __init__(self, seconds: Optional[float] = None, reserve: float = SEARCH_RESERVE):
+        self.limit = seconds
+        self.reserve = reserve
+        self.started = time.monotonic()
+        self.skipped: list[str] = []
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def remaining(self) -> Optional[float]:
+        return None if self.limit is None else self.limit - self.elapsed()
+
+    def can_afford(self, cost: float, *, keep_reserve: bool = True) -> bool:
+        left = self.remaining()
+        if left is None:
+            return True
+        return left >= cost + (self.reserve if keep_reserve else 0.0)
+
+    def note_skip(self, label: str) -> str:
+        """Record and phrase a stand-down. The wording has to make clear the
+        check did not run - a reader must never mistake it for a result.
+        """
+        left = self.remaining()
+        msg = (
+            f"{label} skipped to stay inside this deployment's time limit "
+            f"(~{left:.1f}s left of {self.limit:.1f}s). It was not checked - "
+            "this is not a finding either way."
+        )
+        self.skipped.append(msg)
+        return msg
+
+
 DEFAULT_DEV_SCAN_SIGNATURE_CAP = 40
 DEFAULT_DEV_SCAN_MAX_LAUNCHES = 8
 
@@ -93,6 +164,57 @@ def b58_decode(s: str) -> bytes:
     raw = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
     pad = len(s) - len(s.lstrip("1"))
     return b"\0" * pad + raw
+
+
+def b58_encode(raw: bytes) -> str:
+    """Encode bytes as base58 - the inverse of b58_decode()."""
+    num = int.from_bytes(raw, "big")
+    out = ""
+    while num > 0:
+        num, rem = divmod(num, 58)
+        out = B58_ALPHABET[rem] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
+
+
+# ed25519 field parameters, used only to tell whether 32 bytes land on the
+# curve. A program-derived address is by definition a point that does NOT,
+# which is how find_program_address() picks its bump seed.
+_ED25519_P = 2**255 - 19
+_ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+
+
+def _is_on_ed25519_curve(data: bytes) -> bool:
+    if len(data) != 32:
+        return False
+    y = int.from_bytes(data, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_P:
+        return False
+    p = _ED25519_P
+    u = (y * y - 1) % p
+    v = (_ED25519_D * y * y + 1) % p
+    # Solve x^2 = u/v over the field; a solution existing means y decodes to
+    # a real curve point.
+    uv3 = (u * pow(v, 3, p)) % p
+    uv7 = (u * pow(v, 7, p)) % p
+    x = (uv3 * pow(uv7, (p - 5) // 8, p)) % p
+    vxx = (v * x * x) % p
+    return (vxx - u) % p == 0 or (vxx + u) % p == 0
+
+
+def find_program_address(seeds: list[bytes], program_id: str) -> Optional[str]:
+    """Solana's find_program_address, in pure stdlib.
+
+    Walks bump seeds downward until the hash lands off the ed25519 curve -
+    that off-curve result is the PDA. Used to locate a token's Metaplex
+    metadata account, which is where classic SPL tokens keep their name.
+    """
+    prog = b58_decode(program_id)
+    base = b"".join(seeds)
+    for bump in range(255, -1, -1):
+        digest = hashlib.sha256(base + bytes([bump]) + prog + b"ProgramDerivedAddress").digest()
+        if not _is_on_ed25519_curve(digest):
+            return b58_encode(digest)
+    return None
 
 
 def utc_from_unix(ts: int) -> datetime:
@@ -697,11 +819,17 @@ class DevProfile:
     other_launches: list[OtherLaunch] = field(default_factory=list)
     signatures_scanned: int = 0
     scan_exhausted: bool = True   # False only if the wallet has more history than we checked
+    scan_ran: bool = True         # False = the history scan never ran, so an empty
+                                  # other_launches list means "not checked", NOT
+                                  # "checked and this dev has launched nothing"
+    holding_amount: Optional[float] = None   # dev's CURRENT balance of this token
+    holding_pct: Optional[float] = None      # as a share of supply
+    holding_known: bool = False              # False = lookup failed, not "holds zero"
     notes: list[str] = field(default_factory=list)
 
     @property
     def is_serial_deployer(self) -> bool:
-        return len(self.other_launches) > 0
+        return self.scan_ran and len(self.other_launches) > 0
 
     def to_dict(self) -> dict:
         return {
@@ -712,8 +840,41 @@ class DevProfile:
             "other_launches": [o.to_dict() for o in self.other_launches],
             "signatures_scanned": self.signatures_scanned,
             "scan_exhausted": self.scan_exhausted,
+            "scan_ran": self.scan_ran,
+            "holding_amount": self.holding_amount,
+            "holding_pct": self.holding_pct,
+            "holding_known": self.holding_known,
             "notes": self.notes,
         }
+
+
+def get_wallet_holding(
+    rpc: SolanaRPC, wallet: Optional[str], mint: str, supply_ui: Optional[float]
+) -> tuple[Optional[float], Optional[float], bool]:
+    """A wallet's CURRENT balance of one token, as (amount, pct, known).
+
+    `known=False` means the lookup failed and the caller must not render the
+    result as "holds nothing" - holding zero and not knowing are very
+    different claims to make about a dev wallet.
+    """
+    if not wallet:
+        return None, None, False
+    try:
+        result = rpc.call(
+            "getTokenAccountsByOwner",
+            [wallet, {"mint": mint}, {"encoding": "jsonParsed"}],
+        )
+    except FirstCallooorError:
+        return None, None, False
+
+    total = 0.0
+    for entry in (result or {}).get("value") or []:
+        info = (((entry.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        amount = (info.get("tokenAmount") or {}).get("uiAmount")
+        if amount:
+            total += float(amount)
+    pct = round(total / supply_ui * 100, 4) if supply_ui else None
+    return round(total, 6), pct, True
 
 
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -880,6 +1041,109 @@ def _parsed_mint_info(rpc: SolanaRPC, mint: str) -> Optional[dict]:
     return parsed
 
 
+# --------------------------------------------------------------------------
+# token identity - the name, straight from the chain
+# --------------------------------------------------------------------------
+
+METAPLEX_METADATA_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+
+
+@dataclass
+class TokenIdentity:
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    uri: Optional[str] = None
+    source: str = "unavailable"   # token-2022 | metaplex | unavailable
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "symbol": self.symbol,
+            "uri": self.uri,
+            "source": self.source,
+        }
+
+
+def _metadata_from_mint_extensions(parsed_info: dict) -> Optional[TokenIdentity]:
+    """Token-2022 mints can carry their metadata inside the mint account
+    itself (the tokenMetadata extension), which is what pump.fun's current
+    tokens do - so the name costs nothing extra, it is already in the mint
+    account fetched for the risk check.
+    """
+    for ext in (parsed_info or {}).get("extensions") or []:
+        if ext.get("extension") != "tokenMetadata":
+            continue
+        state = ext.get("state") or {}
+        name = (state.get("name") or "").strip() or None
+        symbol = (state.get("symbol") or "").strip() or None
+        if name or symbol:
+            return TokenIdentity(
+                name=name, symbol=symbol,
+                uri=(state.get("uri") or "").strip() or None,
+                source="token-2022",
+            )
+    return None
+
+
+def _read_borsh_string(buf: bytes, offset: int) -> tuple[str, int]:
+    length = int.from_bytes(buf[offset:offset + 4], "little")
+    raw = buf[offset + 4:offset + 4 + length]
+    return raw.decode("utf-8", "replace").rstrip("\x00").strip(), offset + 4 + length
+
+
+def _metadata_from_metaplex(rpc: SolanaRPC, mint: str) -> Optional[TokenIdentity]:
+    """Classic SPL tokens keep name/symbol in a Metaplex metadata account at
+    a program-derived address. One extra RPC call, and only when the mint
+    itself didn't already carry the name.
+    """
+    pda = find_program_address(
+        [b"metadata", b58_decode(METAPLEX_METADATA_PROGRAM), b58_decode(mint)],
+        METAPLEX_METADATA_PROGRAM,
+    )
+    if not pda:
+        return None
+    try:
+        result = rpc.call("getAccountInfo", [pda, {"encoding": "base64"}])
+    except FirstCallooorError:
+        return None
+    value = (result or {}).get("value")
+    if not value:
+        return None
+    try:
+        raw = base64.b64decode((value.get("data") or ["", ""])[0])
+        # key(1) + update_authority(32) + mint(32), then name, symbol, uri.
+        offset = 1 + 32 + 32
+        name, offset = _read_borsh_string(raw, offset)
+        symbol, offset = _read_borsh_string(raw, offset)
+        uri, _ = _read_borsh_string(raw, offset)
+    except Exception:
+        return None
+    if not (name or symbol):
+        return None
+    return TokenIdentity(name=name or None, symbol=symbol or None,
+                          uri=uri or None, source="metaplex")
+
+
+def resolve_token_identity(
+    rpc: SolanaRPC, mint: str, parsed_info: Optional[dict] = None
+) -> TokenIdentity:
+    """The token's name and symbol, on-chain, without depending on pump.fun.
+
+    pump.fun's public API is the obvious source and has been unreachable
+    (HTTP 530) every single time this project has called it, which is why
+    the name used to show as "not resolved". The chain always has it: a
+    Token-2022 mint carries it in an extension on the mint account, and a
+    classic SPL token keeps it in a Metaplex metadata account.
+    """
+    if parsed_info is None:
+        parsed_info = _parsed_mint_info(rpc, mint)
+    if parsed_info:
+        embedded = _metadata_from_mint_extensions(parsed_info)
+        if embedded:
+            return embedded
+    return _metadata_from_metaplex(rpc, mint) or TokenIdentity()
+
+
 def get_top_holders(
     rpc: SolanaRPC, mint: str, supply_ui: Optional[float]
 ) -> tuple[list[HolderInfo], Optional[str]]:
@@ -930,7 +1194,10 @@ def get_top_holders(
     return holders, None
 
 
-def assess_risk(rpc: SolanaRPC, mint: str, dev_profile: Optional[DevProfile]) -> RiskAssessment:
+def assess_risk(
+    rpc: SolanaRPC, mint: str, dev_profile: Optional[DevProfile],
+    parsed_info: Optional[dict] = None,
+) -> RiskAssessment:
     """Best-effort rug signal from purely on-chain, protocol-level facts.
 
     Deliberately narrow: mint/freeze authority status and SPL account
@@ -938,9 +1205,13 @@ def assess_risk(rpc: SolanaRPC, mint: str, dev_profile: Optional[DevProfile]) ->
     specific internals, so this doesn't carry the same "unverified against
     a live contract" risk as, say, bonding-curve math would. It is still a
     heuristic, not a guarantee - see the disclaimer this always carries.
+
+    `parsed_info` lets the caller hand over a mint account it already
+    fetched (token identity needs the same one) instead of paying for a
+    second identical call.
     """
     notes: list[str] = []
-    info = _parsed_mint_info(rpc, mint)
+    info = parsed_info if parsed_info is not None else _parsed_mint_info(rpc, mint)
     if info is None:
         return RiskAssessment(
             mint_authority=None, freeze_authority=None,
@@ -963,6 +1234,14 @@ def assess_risk(rpc: SolanaRPC, mint: str, dev_profile: Optional[DevProfile]) ->
         top10_pct = round(sum(h.pct_of_supply or 0 for h in top_holders), 2)
 
     dev_launches = len(dev_profile.other_launches) if dev_profile else 0
+    if dev_profile is not None and not dev_profile.scan_ran:
+        # Without the dev history, one of the signals feeding this verdict is
+        # simply missing. Saying so keeps a verdict of "no major red flags"
+        # from being read as "the dev's history came back clean".
+        notes.append(
+            "The dev's launch history was not checked, so it is not part of "
+            "this verdict."
+        )
 
     reasons: list[str] = []
     mint_revoked = mint_authority is None
@@ -1057,6 +1336,127 @@ def check_migration(top_holders: list[HolderInfo]) -> MigrationStatus:
             "the pump.fun bonding curve, or migrated to a venue this check "
             "doesn't recognize yet."
         ),
+    )
+
+
+# --------------------------------------------------------------------------
+# name collisions - is another token already using this name?
+# --------------------------------------------------------------------------
+
+DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
+NAME_MATCH_LIMIT = 8
+
+
+@dataclass
+class NameTwin:
+    mint: str
+    name: Optional[str]
+    symbol: Optional[str]
+    first_pair_unix: Optional[int]
+    first_pair_iso: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "mint": self.mint,
+            "name": self.name,
+            "symbol": self.symbol,
+            "first_pair_seen": self.first_pair_iso,
+            "first_pair_unix": self.first_pair_unix,
+            "chart_url": f"https://dexscreener.com/solana/{self.mint}",
+        }
+
+
+@dataclass
+class NameCollisions:
+    status: str                       # ok | unavailable | skipped
+    searched_name: Optional[str] = None
+    twins: list[NameTwin] = field(default_factory=list)
+    oldest: Optional[NameTwin] = None
+    detail: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "searched_name": self.searched_name,
+            "count": len(self.twins),
+            "oldest": self.oldest.to_dict() if self.oldest else None,
+            "twins": [t.to_dict() for t in self.twins],
+            "detail": self.detail,
+            "caveat": (
+                "Dates are when a token's first DEX pair was seen, not when its "
+                "mint was created - a token can exist on a bonding curve well "
+                "before it has a pair. Treat them as 'first traded', not 'born'."
+            ),
+        }
+
+
+def find_name_collisions(name: Optional[str], exclude_mint: str) -> NameCollisions:
+    """Other Solana tokens already using this token's name.
+
+    A memecoin name is not unique - reusing a name that already ran is a
+    standard impersonation play, and knowing an older token holds the name
+    is exactly the context that "is this the real one?" needs.
+
+    There is no on-chain index of token names, so this needs an off-chain
+    search; DexScreener's public search endpoint needs no key. Never fatal:
+    an unreachable or changed API degrades to `unavailable` rather than
+    taking down the report, and the timestamps are labelled for what they
+    actually are (first pair seen, not mint creation).
+    """
+    clean = (name or "").strip()
+    if not clean:
+        return NameCollisions(status="skipped", detail="No token name resolved to search for.")
+
+    url = f"{DEXSCREENER_SEARCH}?{urllib.parse.urlencode({'q': clean})}"
+    try:
+        data = http_json(url, timeout=6, retries=0)
+    except HttpError as exc:
+        return NameCollisions(
+            status="unavailable", searched_name=clean,
+            detail=f"Name search unavailable (DexScreener returned HTTP {exc.status}).",
+        )
+    except Exception as exc:  # noqa: BLE001 - never fatal, it's a bonus signal
+        return NameCollisions(
+            status="unavailable", searched_name=clean,
+            detail=f"Name search unavailable: {squash(str(exc), 120)}",
+        )
+
+    lowered = clean.lower()
+    # One token has many pairs; keep the earliest pair seen per mint.
+    by_mint: dict[str, NameTwin] = {}
+    for pair in (data or {}).get("pairs") or []:
+        if (pair.get("chainId") or "").lower() != "solana":
+            continue
+        base = pair.get("baseToken") or {}
+        address = base.get("address")
+        if not address or address == exclude_mint:
+            continue
+        twin_name = (base.get("name") or "").strip()
+        twin_symbol = (base.get("symbol") or "").strip()
+        if twin_name.lower() != lowered and twin_symbol.lower() != lowered:
+            continue  # DexScreener matches loosely; only keep real name/symbol hits
+
+        created_ms = pair.get("pairCreatedAt")
+        created_unix = int(created_ms / 1000) if created_ms else None
+        existing = by_mint.get(address)
+        if existing and existing.first_pair_unix is not None:
+            if created_unix is None or created_unix >= existing.first_pair_unix:
+                continue
+        by_mint[address] = NameTwin(
+            mint=address, name=twin_name or None, symbol=twin_symbol or None,
+            first_pair_unix=created_unix,
+            first_pair_iso=iso(utc_from_unix(created_unix)) if created_unix else None,
+        )
+
+    twins = sorted(
+        by_mint.values(),
+        key=lambda t: (t.first_pair_unix is None, t.first_pair_unix or 0),
+    )
+    oldest = next((t for t in twins if t.first_pair_unix is not None), None)
+    return NameCollisions(
+        status="ok", searched_name=clean,
+        twins=twins[:NAME_MATCH_LIMIT], oldest=oldest,
+        detail=None if twins else "No other Solana token found using this name.",
     )
 
 
@@ -1849,7 +2249,17 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
 
     # -- token -------------------------------------------------------------
     section("token")
-    label = f"{cross.name} (${cross.symbol})" if cross.name and cross.symbol else dim("not resolved")
+    token = report.get("token") or {}
+    tname, tsym = token.get("name"), token.get("symbol")
+    if tname and tsym:
+        label = f"{bold(tname)} (${tsym})"
+    elif tname or tsym:
+        label = bold(tname or f"${tsym}")
+    else:
+        label = dim("not resolved")
+    src = token.get("name_source")
+    if src and src != "unavailable":
+        label += dim(f"  [{src}]")
     print(f"  {'CA':<18}{origin.mint}")
     print(f"  {'Name':<18}{label}")
     print(f"  {'Created':<18}{green(origin.created_iso)}  {dim('<- zero point (on-chain)')}")
@@ -1926,13 +2336,55 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
     if dev and dev.get("dev_wallet"):
         section("dev wallet")
         print(f"  {'Wallet':<18}{dev['dev_wallet']}")
-        serial = yellow(f"{dev['other_launches_found']} other launch(es) found") if dev["is_serial_deployer"] else green("no other launches found")
-        scanned_note = f"(checked last {dev['signatures_scanned']} txs)"
-        print(f"  {'History':<18}{serial}  {dim(scanned_note)}")
+        if dev.get("scan_ran") is False:
+            # An empty result from a scan that never ran is not a clean history.
+            print(f"  {'History':<18}{dim('not checked on this run')}")
+        else:
+            serial = yellow(f"{dev['other_launches_found']} other launch(es) found") if dev["is_serial_deployer"] else green("no other launches found")
+            scanned_note = f"(checked last {dev['signatures_scanned']} txs)"
+            print(f"  {'History':<18}{serial}  {dim(scanned_note)}")
+
+        if dev.get("holding_known"):
+            pct = dev.get("holding_pct")
+            amount = dev.get("holding_amount") or 0
+            if pct is None:
+                holding = f"{amount:,.0f} tokens"
+            elif pct >= 20:
+                holding = red(f"{pct}% of supply") + dim(f"  ({amount:,.0f} tokens)")
+            elif pct >= 5:
+                holding = yellow(f"{pct}% of supply") + dim(f"  ({amount:,.0f} tokens)")
+            elif pct > 0:
+                holding = green(f"{pct}% of supply") + dim(f"  ({amount:,.0f} tokens)")
+            else:
+                holding = green("0% - dev holds none of it now")
+            print(f"  {'Dev holds':<18}{holding}")
+        else:
+            print(f"  {'Dev holds':<18}{dim('could not be checked')}")
         for launch in dev["other_launches"][:5]:
             print(f"  {dim('-')} {launch['mint'][:24]}...  {launch['created_at'] or '?'}")
         for note in dev["notes"]:
             print(f"  {dim('-')} {note}")
+
+    # -- name collisions -----------------------------------------------------
+    nc = report.get("name_collisions")
+    if nc and nc.get("status") == "ok":
+        count = nc.get("count") or 0
+        section(f"name check  ({count} other token(s) using this name)")
+        if not count:
+            print(green("  No other Solana token found using this name."))
+        else:
+            oldest = nc.get("oldest")
+            if oldest:
+                print(f"  {yellow('!')} An older token already uses this name: "
+                      f"{bold(oldest.get('name') or '?')} "
+                      f"{dim('first traded ' + (oldest.get('first_pair_seen') or '?'))}")
+                print(dim(f"      {oldest.get('mint')}"))
+            for twin in (nc.get("twins") or [])[1:6]:
+                print(dim(f"  - {twin.get('mint')}  {twin.get('first_pair_seen') or '?'}"))
+            print(dim(f"  {nc.get('caveat')}"))
+    elif nc and nc.get("status") == "unavailable":
+        section("name check")
+        print(dim(f"  {nc.get('detail')}"))
 
     # -- search ------------------------------------------------------------
     section("search")
@@ -2030,6 +2482,8 @@ def build_report(
     dev_profile: Optional[DevProfile] = None,
     risk: Optional[RiskAssessment] = None,
     migration: Optional[MigrationStatus] = None,
+    identity: Optional[TokenIdentity] = None,
+    collisions: Optional[NameCollisions] = None,
 ) -> dict:
     first = triage.timeline[0] if triage.timeline else None
     return {
@@ -2037,7 +2491,15 @@ def build_report(
         "version": VERSION,
         "generated_at": iso(datetime.now(timezone.utc)),
         "input": {"contract_address": ca, "include_retweets": args.include_retweets},
-        "token": {"name": cross.name, "symbol": cross.symbol},
+        "token": {
+            # On-chain identity first: pump.fun's API has been unreachable
+            # every time this project has called it, and the chain always
+            # has the name. pump.fun's values stay as a fallback only.
+            "name": (identity.name if identity and identity.name else cross.name),
+            "symbol": (identity.symbol if identity and identity.symbol else cross.symbol),
+            "metadata_uri": identity.uri if identity else None,
+            "name_source": identity.source if identity else "unavailable",
+        },
         "origin": {
             "created_at": origin.created_iso,
             "created_at_unix": origin.created_unix,
@@ -2086,6 +2548,7 @@ def build_report(
         "dev_profile": dev_profile.to_dict() if dev_profile else None,
         "risk": risk.to_dict() if risk else None,
         "migration": migration.to_dict() if migration else None,
+        "name_collisions": collisions.to_dict() if collisions else None,
     }
 
 
@@ -2135,6 +2598,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="skip checking the dev wallet for other pump.fun launches")
     p.add_argument("--no-risk-check", action="store_true",
                    help="skip the mint/freeze authority + holder-concentration rug signal")
+    p.add_argument("--no-name-check", action="store_true",
+                   help="skip the search for other tokens using the same name")
+    p.add_argument("--time-budget", type=float, default=None,
+                   help="wall-clock seconds for the whole run; optional on-chain "
+                        "extras stand down (and say so) rather than overrun it. "
+                        "Unset means unlimited, which is the right default for "
+                        "a terminal but never for a serverless deployment.")
     p.add_argument("--first-buyers-limit", type=int, default=DEFAULT_FIRST_BUYERS_LIMIT,
                    help=f"max first-buyer wallets to report (default {DEFAULT_FIRST_BUYERS_LIMIT})")
     p.add_argument("--first-buyers-scan-cap", type=int, default=DEFAULT_FIRST_BUYERS_SCAN_CAP,
@@ -2208,36 +2678,90 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     # 1. zero point, straight from the chain
     if args.verbose:
         print(f"[1/3] resolving on-chain creation time via {args.rpc}", file=sys.stderr)
+    # Hold time back for the mention search only when one is actually going
+    # to run. With no credentials configured (or in mock mode) that reserve
+    # is time nothing will ever claim, and holding it would stand the
+    # on-chain extras down to protect a search that never happens.
+    will_search = provider != "none" and not getattr(args, "mock", False)
+    budget = TimeBudget(
+        getattr(args, "time_budget", None),
+        reserve=SEARCH_RESERVE if will_search else 0.0,
+    )
     rpc = SolanaRPC(args.rpc, args.verbose)
     origin = resolve_origin(rpc, ca, args.sig_page_cap)
     origin_dt = utc_from_unix(origin.created_unix)
 
-    # 1b. on-chain extras: first buyers, dev fingerprinting, rug signal,
-    # migration status. Each degrades independently and never aborts the
-    # run - these are bonus signals on top of the actual answer, not it.
+    # 1b. on-chain extras: identity, first buyers, dev fingerprinting, rug
+    # signal, migration status. Each degrades independently and never aborts
+    # the run - these are context around the answer, not the answer itself.
+    #
+    # The mint account is fetched ONCE here and shared: the token's name and
+    # the rug signal both need it, and paying for it twice is exactly the
+    # kind of avoidable RPC cost this project keeps having to police.
+    parsed_mint = _parsed_mint_info(rpc, ca)
+    identity = resolve_token_identity(rpc, ca, parsed_mint)
+
     buyers: list[BuyerActivity] = []
     buyer_notes: list[str] = []
     buyers_skipped = True
     if not getattr(args, "no_first_buyers", False):
-        buyers, buyer_notes, buyers_skipped = find_first_buyers(
-            rpc, origin,
-            limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
-            scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
-        )
+        if budget.can_afford(COST_FIRST_BUYERS):
+            buyers, buyer_notes, buyers_skipped = find_first_buyers(
+                rpc, origin,
+                limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
+                scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
+            )
+        else:
+            buyer_notes.append(budget.note_skip("First-buyer scan"))
 
     dev_profile: Optional[DevProfile] = None
     if not getattr(args, "no_dev_scan", False):
-        dev_profile = find_other_launches(
-            rpc, origin.dev_wallet, ca,
-            signature_cap=getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP),
-            max_launches=getattr(args, "dev_scan_max_launches", DEFAULT_DEV_SCAN_MAX_LAUNCHES),
-        )
+        if budget.can_afford(COST_DEV_SCAN):
+            dev_profile = find_other_launches(
+                rpc, origin.dev_wallet, ca,
+                signature_cap=getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP),
+                max_launches=getattr(args, "dev_scan_max_launches", DEFAULT_DEV_SCAN_MAX_LAUNCHES),
+            )
+        else:
+            # Still carry the wallet - it is already known from the genesis
+            # transaction and costs nothing. Only the history scan stands down.
+            dev_profile = DevProfile(
+                dev_wallet=origin.dev_wallet,
+                scan_exhausted=False,
+                scan_ran=False,
+                notes=[budget.note_skip("Dev history scan")],
+            )
 
     risk: Optional[RiskAssessment] = None
     migration: Optional[MigrationStatus] = None
     if not getattr(args, "no_risk_check", False):
-        risk = assess_risk(rpc, ca, dev_profile)
-        migration = check_migration(risk.top_holders)
+        if budget.can_afford(COST_RISK_CHECK):
+            risk = assess_risk(rpc, ca, dev_profile, parsed_mint)
+            migration = check_migration(risk.top_holders)
+
+    # How much of this token the dev still holds - needs the supply from the
+    # risk pass, so it runs after it.
+    if dev_profile and dev_profile.dev_wallet:
+        if budget.can_afford(COST_DEV_HOLDING):
+            supply_ui = risk.supply_ui if risk else None
+            amount, pct, known = get_wallet_holding(rpc, dev_profile.dev_wallet, ca, supply_ui)
+            dev_profile.holding_amount = amount
+            dev_profile.holding_pct = pct
+            dev_profile.holding_known = known
+        else:
+            # holding_known stays False, which the renderers already show as
+            # "unknown" rather than as "the dev holds nothing".
+            dev_profile.notes.append(budget.note_skip("Dev holdings check"))
+
+    collisions: Optional[NameCollisions] = None
+    if not getattr(args, "no_name_check", False):
+        if budget.can_afford(COST_NAME_CHECK):
+            collisions = find_name_collisions(identity.name, ca)
+        else:
+            collisions = NameCollisions(
+                status="unavailable", searched_name=identity.name,
+                detail=budget.note_skip("Name check"),
+            )
 
     # 2. cross-check (advisory only, never load-bearing)
     cross = (
@@ -2327,6 +2851,8 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
         dev_profile=dev_profile,
         risk=risk,
         migration=migration,
+        identity=identity,
+        collisions=collisions,
     )
     return report, triage, outcome, origin, cross
 

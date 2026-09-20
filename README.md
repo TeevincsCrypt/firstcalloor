@@ -58,6 +58,7 @@ variables if you make it anyway, but it's cleaner to just enter the bare value.)
 | `FIRSTCALLOOR_SIG_PAGE_CAP` | Optional | Signature pages per request, default `12`. Lower it if you hit the function timeout. |
 | `FIRSTCALLOOR_HTTP_TIMEOUT` | Optional | Per-request timeout in seconds, default `6`. The CLI uses a generous 30s; the web path needs every call to fail fast instead of eating the function's whole budget. |
 | `FIRSTCALLOOR_HTTP_RETRIES` | Optional | Retries per request, default `1`. Raise cautiously — each retry can add several seconds. |
+| `FIRSTCALLOOR_TIME_BUDGET` | Optional | Wall-clock seconds for the whole run, default `7.5`. Optional on-chain extras stand down (and say so) rather than overrun Vercel's 10s function limit. |
 | `FIRSTCALLOOR_PRE_WINDOW_HOURS` | Optional | Hours probed before launch for recycled-CA mentions, default `0` on web (`24` on the CLI) — it's an extra, non-essential network round trip the tight web budget usually can't spare. |
 
 **Serverless timeouts matter here.** Walking a busy token's signature history
@@ -84,7 +85,7 @@ api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
 api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
 firstcalloor.py      CLI wrapper around that same engine
 dev_server.py        local server mirroring Vercel's routing
-tests/               104 tests, no network or API key needed
+tests/               150 tests, no network or API key needed
 ```
 
 ---
@@ -221,9 +222,34 @@ output and the JSON, with the reason attached.
 
 ## On-chain extras
 
-Four more signals, computed purely from Solana RPC data — no dependency on
+More signals, computed purely from Solana RPC data — no dependency on
 whether the mention search ran, found anything, or has credits left.
 
+- **Token name, from the chain** — read straight off the mint account.
+  Token-2022 mints (what pump.fun issues today) carry name, symbol and
+  metadata URI in a `tokenMetadata` extension on the mint itself, so the
+  name costs **zero extra RPC calls** — it rides along on the account the
+  rug check already fetches. Classic SPL tokens keep theirs in a Metaplex
+  metadata account at a program-derived address, which costs one more call
+  and only when the mint didn't already carry it. The PDA derivation
+  (sha256 bump walk plus an ed25519 off-curve check) is implemented in pure
+  stdlib, like everything else here. This replaced pump.fun's API as the
+  name source: that endpoint has returned HTTP 530 or 0 on *every* call this
+  project has ever made to it, and the chain always has the answer.
+- **Dev holdings** — how much of this token the dev wallet still holds,
+  summed across all of its token accounts for the mint. `holding_known` is
+  the load-bearing field: `false` means the lookup did not complete, which
+  is reported as "unknown", never as "the dev holds none of it". Those are
+  very different claims to make about a dev wallet.
+- **Name check** — other Solana tokens already using this name, oldest
+  first. Reusing the name of a token that already ran is a standard
+  impersonation play, so knowing an older token holds the name is exactly
+  the context "is this the real one?" needs. There is no on-chain index of
+  token names, so this uses DexScreener's public search endpoint (no key).
+  Its timestamps are labelled for what they actually are — **first DEX pair
+  seen, not mint creation**; a token can live on a bonding curve well before
+  it has a pair. Loose substring matches are discarded: only an exact name
+  or symbol hit counts. Unreachable endpoint degrades to `unavailable`.
 - **First buyers** — the earliest wallets to receive tokens after genesis.
   A wallet counts as a buyer when its own token balance for the mint
   increases between a transaction's pre- and post-state; the transaction's
@@ -266,18 +292,45 @@ browser extension is a different deliverable (manifest, content script,
 Chrome Web Store distribution) from this website, and matching pump.fun's
 live DOM isn't verifiable from here either.
 
-**Web vs. CLI defaults** — the dev-wallet scan is **off by default on the
-website** (measured ~2.4s of a already-tight ~10s serverless budget,
-generally the least urgent of the three for an at-a-glance decision) but on
-by default on the CLI, which has no such constraint:
+**Web vs. CLI defaults** — the dev-wallet scan now runs by default on the
+website too, paid for by dropping the pump.fun cross-check, which cost
+strictly more (up to a 6s timeout) and gave strictly less now that the token
+name comes off the chain for free:
 
 | Variable | Default (web) | Default (CLI flag) |
 |---|---|---|
 | `FIRSTCALLOOR_NO_FIRST_BUYERS` | off (runs) | `--no-first-buyers` |
-| `FIRSTCALLOOR_NO_DEV_SCAN` | **on (skipped)** | `--no-dev-scan` |
+| `FIRSTCALLOOR_NO_DEV_SCAN` | off (runs) | `--no-dev-scan` |
 | `FIRSTCALLOOR_NO_RISK_CHECK` | off (runs) | `--no-risk-check` |
+| `FIRSTCALLOOR_NO_NAME_CHECK` | off (runs) | `--no-name-check` |
+| `FIRSTCALLOOR_NO_CROSS_CHECK` | **on (skipped)** | `--no-cross-check` |
 | `FIRSTCALLOOR_FIRST_BUYERS_LIMIT` / `_SCAN_CAP` | `5` / `6` | `--first-buyers-limit` / `--first-buyers-scan-cap` (`10` / `20`) |
 | `FIRSTCALLOOR_DEV_SCAN_CAP` / `_MAX_LAUNCHES` | `8` / `2` | `--dev-scan-cap` / `--dev-scan-max-launches` (`40` / `8`) |
+
+### The time budget
+
+`HttpBudget` bounds any *single* request. `FIRSTCALLOOR_TIME_BUDGET`
+(default `7.5` seconds on the web path, unset/unlimited on the CLI) bounds
+the **whole run**, which is a different failure mode: a dozen
+individually-fine RPC calls against a slow endpoint still add up past
+Vercel's 10s wall, and overrunning that wall isn't a slow page — the
+platform kills the process and the browser gets an opaque crash page
+instead of anything this code would have said.
+
+It matters most because the on-chain extras run *before* the mention
+search, so without a guard the bonus context can eat the budget and the
+actual answer — who called it first — never runs at all. Each extra has to
+show it can afford itself *and* leave the search its reserve, or it stands
+down. Measured against a slow public RPC (~0.6s per `getTransaction`), a
+full run costs ~19s; the budget brings that to ~7s by standing down on
+whatever doesn't fit.
+
+A stand-down is always reported as **"not checked"**, never as a result.
+An unscanned dev wallet reports `scan_ran: false` and renders as "Not
+checked" rather than "None found" — a check that didn't run must never be
+readable as a clean bill of health. The reserve is only held back when a
+mention search is actually going to run; with no credentials configured
+it would be protecting a search that never happens.
 
 ---
 
@@ -298,6 +351,10 @@ by default on the CLI, which has no such constraint:
 --no-first-buyers       skip first-buy-wallet detection
 --no-dev-scan           skip the dev wallet's other-launches check
 --no-risk-check         skip the mint/freeze authority + holder-concentration signal
+--no-name-check         skip the search for other tokens using the same name
+--time-budget SECONDS   wall-clock cap for the whole run; optional extras stand
+                        down (and say so) rather than overrun it. Unset =
+                        unlimited, right for a terminal, never for serverless
 --first-buyers-limit N  max first-buyer wallets to report (default 10)
 --first-buyers-scan-cap N   post-genesis txs to check for buys (default 20)
 --dev-scan-cap N        dev wallet's recent txs to check (default 40)
@@ -343,7 +400,7 @@ and `search` metadata including every note about incompleteness.
 python -m unittest discover -s tests -v
 ```
 
-104 tests. X, twitterapi.io, and pump.fun are all stubbed at the HTTP layer,
+150 tests. X, twitterapi.io, DexScreener, and pump.fun are all stubbed at the HTTP layer,
 so the search strategy — window expansion, cap contraction, rate-limit
 cut-off, the 7-day clamp (and its absence on twitterapi.io) — is verified
 without network access or an API key. The on-chain extras (first buyers, dev
