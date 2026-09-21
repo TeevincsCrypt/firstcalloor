@@ -2040,5 +2040,289 @@ class TestNameCollisionsWithLookalikes(unittest.TestCase):
         self.assertTrue(payload["twins"][0]["is_impersonation"])
 
 
+# --------------------------------------------------------------------------
+# dev portfolio - everything the wallet holds right now
+# --------------------------------------------------------------------------
+
+def holding(mint, amount, decimals=6):
+    return {"account": {"data": {"parsed": {"info": {
+        "mint": mint,
+        "tokenAmount": {"uiAmount": amount, "decimals": decimals},
+    }}}}}
+
+
+def supply_value(supply, decimals=6):
+    return {"data": {"parsed": {"info": {"supply": supply, "decimals": decimals}}}}
+
+
+class PortfolioRPC(ScriptedRPC):
+    """Routes the two getTokenAccountsByOwner programs separately, and the
+    several getMultipleAccounts calls (supplies, then names) in order."""
+
+    def __init__(self, *, classic=None, token2022=None, supplies=None,
+                 multi_sequence=None, fail_programs=()):
+        super().__init__({})
+        self.classic = classic if classic is not None else []
+        self.token2022 = token2022 if token2022 is not None else []
+        self.supplies = supplies or {}
+        self.multi_sequence = list(multi_sequence or [])
+        self.fail_programs = set(fail_programs)
+        self.multi_calls = 0
+
+    def call(self, method, params):
+        self.calls.append((method, params))
+        if method == "getTokenAccountsByOwner":
+            program = params[1].get("programId")
+            if program in self.fail_programs:
+                raise fc.FirstCallooorError("rate limited")
+            return {"value": self.classic if program == fc.TOKEN_PROGRAM_ID else self.token2022}
+        if method == "getMultipleAccounts":
+            self.multi_calls += 1
+            if self.multi_sequence:
+                return self.multi_sequence.pop(0)
+            # default: the supply lookup
+            return {"value": [self.supplies.get(m) for m in params[0]]}
+        return None
+
+
+MINT_A = "A1bcdefghjkmnpqrstuvwxyzABCDEFGH23456789pump"
+MINT_B = "B2bcdefghjkmnpqrstuvwxyzABCDEFGH23456789pump"
+
+
+class TestGetWalletPortfolio(unittest.TestCase):
+    def test_no_wallet_is_skipped_and_costs_no_call(self):
+        rpc = PortfolioRPC()
+        result = fc.get_wallet_portfolio(rpc, None, VALID_CA)
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(rpc.calls, [])
+
+    def test_reads_both_token_programs(self):
+        rpc = PortfolioRPC(classic=[holding(MINT_A, 10.0)],
+                            token2022=[holding(MINT_B, 20.0)])
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.total_positions, 2)
+        programs = [p[1].get("programId") for m, p in rpc.calls
+                    if m == "getTokenAccountsByOwner"]
+        self.assertEqual(programs, [fc.TOKEN_PROGRAM_ID, fc.TOKEN_2022_PROGRAM_ID])
+
+    def test_zero_balances_are_closed_positions_not_holdings(self):
+        rpc = PortfolioRPC(classic=[holding(MINT_A, 0), holding(MINT_B, 5.0)])
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual([e.mint for e in result.entries], [MINT_B])
+
+    def test_sums_several_accounts_for_the_same_mint(self):
+        rpc = PortfolioRPC(classic=[holding(MINT_A, 10.0), holding(MINT_A, 2.5)])
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.entries[0].amount_ui, 12.5)
+
+    def test_ranks_by_share_of_each_tokens_own_supply(self):
+        # 100 of a 1,000-supply token is a bigger position than 500 of a
+        # 1,000,000-supply one, even though 500 is the larger number.
+        rpc = PortfolioRPC(
+            classic=[holding(MINT_A, 500.0), holding(MINT_B, 100.0)],
+            supplies={MINT_A: supply_value(str(1_000_000 * 10**6)),
+                      MINT_B: supply_value(str(1_000 * 10**6))},
+        )
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual([e.mint for e in result.entries], [MINT_B, MINT_A])
+        self.assertEqual(result.entries[0].pct_of_supply, 10.0)
+
+    def test_the_analysed_token_sorts_first_whatever_its_size(self):
+        rpc = PortfolioRPC(
+            classic=[holding(MINT_A, 999_999.0), holding(VALID_CA, 1.0)],
+            supplies={MINT_A: supply_value(str(1_000_000 * 10**6)),
+                      VALID_CA: supply_value(str(1_000_000_000 * 10**6))},
+        )
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.entries[0].mint, VALID_CA)
+        self.assertTrue(result.entries[0].is_this_token)
+
+    def test_unknown_supply_leaves_share_null_and_sorts_last(self):
+        rpc = PortfolioRPC(
+            classic=[holding(MINT_A, 5.0), holding(MINT_B, 5.0)],
+            supplies={MINT_B: supply_value(str(1_000 * 10**6))},
+        )
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.entries[0].mint, MINT_B)
+        self.assertIsNone(result.entries[-1].pct_of_supply)
+
+    def test_empty_wallet_says_so_rather_than_going_quiet(self):
+        result = fc.get_wallet_portfolio(PortfolioRPC(), "DevWallet1", VALID_CA)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.total_positions, 0)
+        self.assertIn("no tokens", result.detail)
+
+    def test_both_programs_failing_is_unavailable(self):
+        rpc = PortfolioRPC(fail_programs=(fc.TOKEN_PROGRAM_ID, fc.TOKEN_2022_PROGRAM_ID))
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.status, "unavailable")
+
+    def test_one_program_failing_is_a_partial_list_that_says_so(self):
+        rpc = PortfolioRPC(token2022=[holding(MINT_B, 5.0)],
+                            fail_programs=(fc.TOKEN_PROGRAM_ID,))
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([e.mint for e in result.entries], [MINT_B])
+        self.assertIn("missing positions", result.detail)
+
+    def test_caps_how_many_positions_are_named(self):
+        mints = [f"Mnt{i}".ljust(44, "x") for i in range(20)]
+        rpc = PortfolioRPC(classic=[holding(m, 10.0) for m in mints])
+        result = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA, name_limit=5)
+        self.assertEqual(result.total_positions, 20)
+        self.assertEqual(len(result.entries), 5)
+
+    def test_serialised_result_carries_the_no_price_caveat(self):
+        rpc = PortfolioRPC(classic=[holding(MINT_A, 10.0)])
+        payload = fc.get_wallet_portfolio(rpc, "DevWallet1", VALID_CA).to_dict()
+        self.assertEqual(payload["total_positions"], 1)
+        self.assertIn("no price source", payload["caveat"])
+        self.assertIn("already sold shows nothing", payload["caveat"])
+
+
+class TestResolveMintNames(unittest.TestCase):
+    def test_token_2022_names_cost_a_single_batched_call(self):
+        rpc = PortfolioRPC(multi_sequence=[{"value": [
+            {"data": {"parsed": {"info": token2022_mint(name="Alpha", symbol="ALP")}}},
+            {"data": {"parsed": {"info": token2022_mint(name="Beta", symbol="BET")}}},
+        ]}])
+        names = fc._resolve_mint_names(rpc, [MINT_A, MINT_B])
+        self.assertEqual(names[MINT_A].name, "Alpha")
+        self.assertEqual(names[MINT_B].name, "Beta")
+        self.assertEqual(rpc.multi_calls, 1)
+
+    def test_falls_back_to_one_batched_metaplex_call(self):
+        rpc = PortfolioRPC(multi_sequence=[
+            {"value": [{"data": {"parsed": {"info": {"decimals": 6}}}}]},   # no embedded name
+            metaplex_batch := {"value": [metaplex_account(name="Classic", symbol="CLS")["value"]]},
+        ])
+        names = fc._resolve_mint_names(rpc, [MINT_A])
+        self.assertEqual(names[MINT_A].name, "Classic")
+        self.assertEqual(names[MINT_A].source, "metaplex")
+        self.assertEqual(rpc.multi_calls, 2)
+
+    def test_no_mints_makes_no_call(self):
+        rpc = PortfolioRPC()
+        self.assertEqual(fc._resolve_mint_names(rpc, []), {})
+        self.assertEqual(rpc.calls, [])
+
+    def test_rpc_failure_leaves_tokens_unnamed_rather_than_raising(self):
+        class Boom(ScriptedRPC):
+            def call(self, method, params):
+                raise fc.FirstCallooorError("down")
+
+        self.assertEqual(fc._resolve_mint_names(Boom({}), [MINT_A]), {})
+
+
+# --------------------------------------------------------------------------
+# budget pricing from measured latency
+# --------------------------------------------------------------------------
+
+class FakeTimedRPC:
+    def __init__(self, avg):
+        self._avg = avg
+
+    @property
+    def avg_call_seconds(self):
+        return self._avg
+
+
+class TestBudgetPricing(unittest.TestCase):
+    def test_falls_back_to_a_pessimistic_rate_before_anything_is_measured(self):
+        b = fc.TimeBudget(10.0)
+        expected = 5 * fc.ASSUMED_CALL_SECONDS * fc.COST_SAFETY_FACTOR
+        self.assertAlmostEqual(b.price(5, FakeTimedRPC(None)), expected)
+        self.assertAlmostEqual(b.price(5, None), expected)
+
+    def test_a_fast_endpoint_prices_work_cheaply(self):
+        # The whole point: on a fast endpoint the dev scan must fit, where a
+        # fixed pessimistic estimate would have skipped it.
+        b = fc.TimeBudget(8.0)
+        b.started -= 2.0                       # 6s left
+        fast = FakeTimedRPC(0.05)
+        self.assertTrue(b.can_afford_calls(fc.CALLS_DEV_SCAN, fast))
+        self.assertTrue(b.can_afford_calls(fc.CALLS_DEV_PORTFOLIO, fast))
+
+    def test_a_slow_endpoint_prices_the_same_work_out_of_reach(self):
+        b = fc.TimeBudget(8.0)
+        b.started -= 2.0                       # same 6s left
+        slow = FakeTimedRPC(1.2)
+        self.assertFalse(b.can_afford_calls(fc.CALLS_DEV_SCAN, slow))
+
+    def test_safety_factor_is_applied(self):
+        b = fc.TimeBudget(10.0)
+        self.assertAlmostEqual(
+            b.price(10, FakeTimedRPC(0.1)), 10 * 0.1 * fc.COST_SAFETY_FACTOR)
+
+    def test_reserve_defaults_to_zero(self):
+        # The search runs before the extras, so there is nothing downstream
+        # to protect - a non-zero default would hold time back from every
+        # caller that didn't think about it, which is what skipped the dev
+        # scan on deployments that had plenty of time for it.
+        self.assertEqual(fc.TimeBudget(10.0).reserve, 0.0)
+
+    def test_every_phase_fits_a_normal_budget_on_a_fast_endpoint(self):
+        # The regression this pricing exists to prevent: on a fast endpoint
+        # with 6s left, every extra must run rather than stand down. Uses
+        # the WEB caps (6 and 8), which is the deployment that has a wall
+        # clock at all - the CLI's much larger caps are unbounded by design.
+        budget = fc.TimeBudget(8.0)
+        budget.started -= 2.0
+        fast = FakeTimedRPC(0.06)
+        phases = (
+            fc.calls_for_first_buyers(6),
+            fc.calls_for_dev_scan(8),
+            fc.CALLS_RISK_CHECK, fc.CALLS_DEV_HOLDING,
+            fc.CALLS_DEV_PORTFOLIO, fc.CALLS_NAME_CHECK,
+        )
+        for calls in phases:
+            self.assertTrue(budget.can_afford_calls(calls, fast))
+            budget.started -= calls * 0.06      # charge what it really costs
+
+    def test_call_estimates_account_for_the_version_retry(self):
+        # One signature can cost two getTransaction calls; counting one
+        # underestimates the scan phases by half, which overruns the wall.
+        self.assertEqual(fc.calls_for_first_buyers(6), 12)
+        self.assertEqual(fc.calls_for_dev_scan(8), 17)
+
+    def test_no_limit_affords_any_call_count(self):
+        self.assertTrue(fc.TimeBudget(None).can_afford_calls(10_000, FakeTimedRPC(5.0)))
+
+
+class TestRpcLatencyTracking(unittest.TestCase):
+    def test_average_is_none_before_any_call(self):
+        self.assertIsNone(fc.SolanaRPC("stub://rpc").avg_call_seconds)
+
+    def test_failed_calls_still_count_toward_the_average(self):
+        # A slow endpoint that times out is the strongest possible evidence
+        # that it is slow; ignoring those samples would price the next phase
+        # off only the calls that happened to succeed.
+        rpc = fc.SolanaRPC("stub://rpc")
+        original = fc.http_json
+        try:
+            def boom(*a, **k):
+                raise fc.HttpError(429, "slow down", "stub://rpc")
+
+            fc.http_json = boom
+            with self.assertRaises(fc.FirstCallooorError):
+                rpc.call("getSignaturesForAddress", [])
+        finally:
+            fc.http_json = original
+        self.assertEqual(rpc.call_count, 1)
+        self.assertIsNotNone(rpc.avg_call_seconds)
+
+    def test_successful_calls_are_counted(self):
+        rpc = fc.SolanaRPC("stub://rpc")
+        original = fc.http_json
+        try:
+            fc.http_json = lambda *a, **k: {"result": 1}
+            rpc.call("getAccountInfo", [])
+            rpc.call("getAccountInfo", [])
+        finally:
+            fc.http_json = original
+        self.assertEqual(rpc.call_count, 2)
+        self.assertGreaterEqual(rpc.avg_call_seconds, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

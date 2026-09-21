@@ -81,16 +81,45 @@ DEFAULT_FIRST_BUYERS_SCAN_CAP = 20
 # itself AND leave the search its reserve, or it stands down and says so.
 # Skipped-for-time is reported as exactly that, never as "found nothing".
 
-# Rough per-phase costs in seconds, sized from observed behaviour against a
-# slow public RPC (~0.6s per getTransaction) rather than a fast paid one -
-# budgeting for the good case is how you overrun the wall in the bad one.
-COST_FIRST_BUYERS = 3.0
-COST_DEV_SCAN = 3.5
-COST_RISK_CHECK = 1.0
-COST_DEV_HOLDING = 0.6
-COST_NAME_CHECK = 1.8   # two searches: the name and the ticker
-# What the mention search itself needs: one to three HTTP calls with pacing
-# between them. This is the reserve every optional phase must leave behind.
+# Per-phase costs, counted in RPC ROUND TRIPS rather than seconds, because
+# seconds are a property of the endpoint and not of the work. A paid
+# endpoint and the throttled public one differ by roughly an order of
+# magnitude per call, so any fixed number of seconds is wrong for one of
+# them - and erring pessimistic is what silently skipped the dev scan on
+# deployments that had plenty of time for it. The budget multiplies these
+# by the latency it has actually measured this run.
+# get_transaction may call twice for one signature: nodes reject a
+# transaction whose version exceeds the one advertised and name the version
+# they need, so it retries. Counting one call per signature underestimates
+# these two phases by roughly half, which is enough to overrun the wall.
+CALLS_PER_TRANSACTION = 2
+
+
+def calls_for_first_buyers(scan_cap: int) -> int:
+    return max(1, scan_cap) * CALLS_PER_TRANSACTION
+
+
+def calls_for_dev_scan(signature_cap: int) -> int:
+    # One signature page for the wallet, then a transaction per candidate.
+    return 1 + max(1, signature_cap) * CALLS_PER_TRANSACTION
+
+
+CALLS_RISK_CHECK = 3          # mint account, largest accounts, owners
+CALLS_DEV_HOLDING = 1
+CALLS_DEV_PORTFOLIO = 5       # two programs, supplies, then names
+CALLS_NAME_CHECK = 2          # two DexScreener searches, not RPC, but similar
+
+# Before any call has been timed, assume a slow endpoint: starting
+# optimistic risks overrunning the wall, starting pessimistic only risks
+# skipping one extra on the very first phase.
+ASSUMED_CALL_SECONDS = 0.6
+# Phases overrun their estimate sometimes; leave room so that being a
+# little wrong costs an extra, not the whole response.
+COST_SAFETY_FACTOR = 1.3
+
+# Reserve for a mention search that has not run yet. The default ordering
+# runs the search first, so this is normally zero - it exists for callers
+# that put the extras ahead of it.
 SEARCH_RESERVE = 4.0
 
 
@@ -100,8 +129,12 @@ class TimeBudget:
     endpoint, a serverless function cannot.
     """
 
-    def __init__(self, seconds: Optional[float] = None, reserve: float = SEARCH_RESERVE):
+    def __init__(self, seconds: Optional[float] = None, reserve: float = 0.0):
         self.limit = seconds
+        # Defaults to zero because the standard ordering runs the mention
+        # search BEFORE the optional extras, so there is nothing downstream
+        # left to protect. A non-zero default would quietly hold time back
+        # from every caller that didn't think about it.
         self.reserve = reserve
         self.started = time.monotonic()
         self.skipped: list[str] = []
@@ -112,11 +145,24 @@ class TimeBudget:
     def remaining(self) -> Optional[float]:
         return None if self.limit is None else self.limit - self.elapsed()
 
-    def can_afford(self, cost: float, *, keep_reserve: bool = True) -> bool:
+    def price(self, calls: int, rpc: Optional["SolanaRPC"] = None) -> float:
+        """What `calls` round trips should cost, at this run's observed pace."""
+        measured = rpc.avg_call_seconds if rpc is not None else None
+        per_call = measured if measured else ASSUMED_CALL_SECONDS
+        return calls * per_call * COST_SAFETY_FACTOR
+
+    def can_afford(
+        self, cost: float, *, keep_reserve: bool = True
+    ) -> bool:
         left = self.remaining()
         if left is None:
             return True
         return left >= cost + (self.reserve if keep_reserve else 0.0)
+
+    def can_afford_calls(
+        self, calls: int, rpc: Optional["SolanaRPC"] = None, *, keep_reserve: bool = True
+    ) -> bool:
+        return self.can_afford(self.price(calls, rpc), keep_reserve=keep_reserve)
 
     def note_skip(self, label: str) -> str:
         """Record and phrase a stand-down. The wording has to make clear the
@@ -133,6 +179,12 @@ class TimeBudget:
 
 
 DEFAULT_DEV_SCAN_SIGNATURE_CAP = 40
+
+# Defined here rather than beside the other cost constants because they
+# are derived from the caps above.
+CALLS_FIRST_BUYERS = calls_for_first_buyers(DEFAULT_FIRST_BUYERS_SCAN_CAP)
+CALLS_DEV_SCAN = calls_for_dev_scan(DEFAULT_DEV_SCAN_SIGNATURE_CAP)
+
 DEFAULT_DEV_SCAN_MAX_LAUNCHES = 8
 
 USER_AGENT = f"firstcalloor/{VERSION}"
@@ -479,13 +531,31 @@ class SolanaRPC:
             )
         self.verbose = verbose
         self._id = 0
+        # How this endpoint actually performs, measured rather than assumed.
+        # A paid endpoint and the throttled public one differ by roughly an
+        # order of magnitude per call, so a fixed cost estimate is either
+        # too pessimistic for one or too optimistic for the other - and
+        # being too pessimistic is what silently skips the dev scan on a
+        # perfectly fast deployment.
+        self.call_count = 0
+        self.total_seconds = 0.0
+
+    @property
+    def avg_call_seconds(self) -> Optional[float]:
+        """Mean round trip so far, or None before any call has completed."""
+        if not self.call_count:
+            return None
+        return self.total_seconds / self.call_count
 
     def call(self, method: str, params: list) -> Any:
         self._id += 1
         payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
+        started = time.monotonic()
         try:
             data = http_json(self.endpoint, method="POST", payload=payload)
         except HttpError as exc:
+            self.call_count += 1
+            self.total_seconds += time.monotonic() - started
             if exc.status == 429:
                 raise FirstCallooorError(
                     f"Solana RPC rate-limited us ({self.endpoint}).\n"
@@ -495,6 +565,9 @@ class SolanaRPC:
             raise FirstCallooorError(
                 f"Solana RPC call {method} failed: HTTP {exc.status} {squash(exc.body, 200)}"
             ) from exc
+
+        self.call_count += 1
+        self.total_seconds += time.monotonic() - started
 
         if isinstance(data, dict) and data.get("error"):
             err = data["error"]
@@ -875,6 +948,241 @@ def get_wallet_holding(
             total += float(amount)
     pct = round(total / supply_ui * 100, 4) if supply_ui else None
     return round(total, 6), pct, True
+
+
+# The two SPL token programs. A wallet's holdings can live under either -
+# classic SPL for older tokens, Token-2022 for what pump.fun issues now -
+# and getTokenAccountsByOwner takes exactly one program per call, so a
+# complete portfolio costs one call each. Missing the second would silently
+# under-report a dev's holdings, which is the opposite of the point.
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+# A dev wallet can hold dust in hundreds of tokens - airdrops, worthless
+# leftovers, spam. Naming every one costs RPC calls, so only the largest
+# are resolved and the rest are counted.
+PORTFOLIO_NAME_LIMIT = 12
+
+
+@dataclass
+class PortfolioEntry:
+    mint: str
+    amount_ui: float
+    decimals: int
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    pct_of_supply: Optional[float] = None
+    is_this_token: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "mint": self.mint,
+            "amount": self.amount_ui,
+            "name": self.name,
+            "symbol": self.symbol,
+            "pct_of_supply": self.pct_of_supply,
+            "is_this_token": self.is_this_token,
+            "chart_url": f"https://dexscreener.com/solana/{self.mint}",
+        }
+
+
+@dataclass
+class Portfolio:
+    status: str                      # ok | unavailable | skipped
+    wallet: Optional[str] = None
+    entries: list[PortfolioEntry] = field(default_factory=list)
+    total_positions: int = 0         # before any display limit
+    named_count: int = 0
+    detail: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "wallet": self.wallet,
+            "wallet_url": f"https://solscan.io/account/{self.wallet}" if self.wallet else None,
+            "total_positions": self.total_positions,
+            "shown": len(self.entries),
+            "entries": [e.to_dict() for e in self.entries],
+            "detail": self.detail,
+            "caveat": (
+                "Current balances only - a wallet that already sold shows nothing "
+                "here, and holdings say nothing about what the wallet paid or is "
+                "worth. Positions are ranked by share of each token's own supply, "
+                "not by dollar value; this tool has no price source."
+            ),
+        }
+
+
+def _resolve_mint_names(
+    rpc: SolanaRPC, mints: list[str]
+) -> dict[str, TokenIdentity]:
+    """Names for several mints in as few calls as possible.
+
+    getMultipleAccounts takes up to 100 accounts per call, so a whole
+    portfolio's Token-2022 names cost ONE call. Classic SPL mints need
+    their Metaplex account instead, which is a second batched call against
+    the derived addresses - not one call per token.
+    """
+    out: dict[str, TokenIdentity] = {}
+    if not mints:
+        return out
+
+    try:
+        multi = rpc.call("getMultipleAccounts", [mints, {"encoding": "jsonParsed"}])
+    except FirstCallooorError:
+        return out
+    needs_metaplex: list[str] = []
+    for mint, value in zip(mints, (multi or {}).get("value") or []):
+        parsed = (((value or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        embedded = _metadata_from_mint_extensions(parsed) if parsed else None
+        if embedded:
+            out[mint] = embedded
+        else:
+            needs_metaplex.append(mint)
+
+    if not needs_metaplex:
+        return out
+
+    pdas: dict[str, str] = {}
+    for mint in needs_metaplex:
+        try:
+            pda = find_program_address(
+                [b"metadata", b58_decode(METAPLEX_METADATA_PROGRAM), b58_decode(mint)],
+                METAPLEX_METADATA_PROGRAM,
+            )
+        except ValueError:
+            continue   # a mint address that won't decode just stays unnamed
+        if pda:
+            pdas[mint] = pda
+    if not pdas:
+        return out
+    try:
+        multi = rpc.call("getMultipleAccounts", [list(pdas.values()), {"encoding": "base64"}])
+    except FirstCallooorError:
+        return out
+    for mint, value in zip(pdas.keys(), (multi or {}).get("value") or []):
+        if not value:
+            continue
+        try:
+            raw = base64.b64decode((value.get("data") or ["", ""])[0])
+            offset = 1 + 32 + 32
+            name, offset = _read_borsh_string(raw, offset)
+            symbol, _ = _read_borsh_string(raw, offset)
+        except Exception:  # noqa: BLE001 - a malformed account is just unnamed
+            continue
+        if name or symbol:
+            out[mint] = TokenIdentity(
+                name=name or None, symbol=symbol or None, source="metaplex")
+    return out
+
+
+def get_wallet_portfolio(
+    rpc: SolanaRPC, wallet: Optional[str], this_mint: str,
+    name_limit: int = PORTFOLIO_NAME_LIMIT,
+) -> Portfolio:
+    """Every token this wallet currently holds, largest position first.
+
+    "Largest" means share of each token's own supply, because that is the
+    only comparable number available without a price feed: 10,000 of one
+    token and 10,000 of another are not comparable amounts, while 4% of one
+    supply and 0.001% of another are. Claiming a dollar ranking without a
+    price source would be inventing precision.
+
+    Costs two calls to list the holdings (classic SPL and Token-2022 are
+    separate programs) plus at most two batched calls to name the largest
+    ones. Never fatal - a failure degrades to `unavailable`.
+    """
+    if not wallet:
+        return Portfolio(status="skipped", detail="No dev wallet identified for this token.")
+
+    raw: list[dict] = []
+    failures = 0
+    for program in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+        try:
+            result = rpc.call(
+                "getTokenAccountsByOwner",
+                [wallet, {"programId": program}, {"encoding": "jsonParsed"}],
+            )
+        except FirstCallooorError:
+            failures += 1
+            continue
+        raw.extend((result or {}).get("value") or [])
+    if failures == 2:
+        return Portfolio(
+            status="unavailable", wallet=wallet,
+            detail="Could not read this wallet's token accounts.",
+        )
+
+    # One wallet can hold several accounts for the same mint.
+    by_mint: dict[str, PortfolioEntry] = {}
+    for entry in raw:
+        info = (((entry.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        mint = info.get("mint")
+        token_amount = info.get("tokenAmount") or {}
+        amount = token_amount.get("uiAmount")
+        if not mint or not amount:
+            continue        # a zero balance is a closed position, not a holding
+        existing = by_mint.get(mint)
+        if existing:
+            existing.amount_ui = round(existing.amount_ui + float(amount), 6)
+            continue
+        by_mint[mint] = PortfolioEntry(
+            mint=mint, amount_ui=round(float(amount), 6),
+            decimals=int(token_amount.get("decimals") or 0),
+            is_this_token=(mint == this_mint),
+        )
+
+    if not by_mint:
+        return Portfolio(
+            status="ok", wallet=wallet, total_positions=0,
+            detail="This wallet holds no tokens right now.",
+        )
+
+    # Rank by share of supply, which needs each mint's supply - one batched
+    # call for all of them. Mints whose supply can't be read keep a null
+    # share and sort last rather than being dropped or guessed at.
+    mints = list(by_mint.keys())
+    try:
+        supplies = rpc.call("getMultipleAccounts", [mints, {"encoding": "jsonParsed"}])
+        for mint, value in zip(mints, (supplies or {}).get("value") or []):
+            parsed = (((value or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+            raw_supply, decimals = parsed.get("supply"), parsed.get("decimals")
+            if raw_supply is None or decimals is None:
+                continue
+            supply_ui = int(raw_supply) / (10 ** int(decimals))
+            if supply_ui:
+                by_mint[mint].pct_of_supply = round(
+                    by_mint[mint].amount_ui / supply_ui * 100, 4)
+    except FirstCallooorError:
+        pass   # shares stay unknown; the positions themselves are still real
+
+    entries = sorted(
+        by_mint.values(),
+        key=lambda e: (
+            not e.is_this_token,               # this token always first
+            e.pct_of_supply is None,
+            -(e.pct_of_supply or 0.0),
+        ),
+    )
+    shown = entries[:name_limit]
+    names = _resolve_mint_names(rpc, [e.mint for e in shown])
+    for entry in shown:
+        identity = names.get(entry.mint)
+        if identity:
+            entry.name, entry.symbol = identity.name, identity.symbol
+
+    detail = None
+    if failures:
+        detail = (
+            "One of the two token programs didn't respond, so this list may be "
+            "missing positions."
+        )
+    return Portfolio(
+        status="ok", wallet=wallet, entries=shown,
+        total_positions=len(entries),
+        named_count=sum(1 for e in shown if e.name or e.symbol),
+        detail=detail,
+    )
 
 
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -2661,6 +2969,32 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
         for note in dev["notes"]:
             print(f"  {dim('-')} {note}")
 
+    # -- dev portfolio -------------------------------------------------------
+    pf = report.get("dev_portfolio")
+    if pf and pf.get("status") == "ok":
+        section(f"dev holdings  ({pf['total_positions']} token(s) held right now)")
+        if not pf["total_positions"]:
+            print(dim(f"  {pf.get('detail') or 'This wallet holds no tokens right now.'}"))
+        else:
+            for entry in pf.get("entries") or []:
+                label = entry.get("name") or "unnamed token"
+                sym = f" (${entry['symbol']})" if entry.get("symbol") else ""
+                pct = entry.get("pct_of_supply")
+                share = f"{pct}% of supply" if pct is not None else "share unknown"
+                marker = yellow("*") if entry.get("is_this_token") else dim("-")
+                this = dim("  <- this token") if entry.get("is_this_token") else ""
+                amount = f"{entry['amount']:,.0f} tokens"
+                print(f"  {marker} {label}{sym}  {dim(amount + '  ' + share)}{this}")
+                print(dim(f"      {entry['mint']}"))
+            if pf["total_positions"] > pf["shown"]:
+                print(dim(f"  ... and {pf['total_positions'] - pf['shown']} smaller position(s) not shown"))
+            if pf.get("detail"):
+                print(dim(f"  {pf['detail']}"))
+            print(dim(f"  {pf['caveat']}"))
+    elif pf and pf.get("status") == "unavailable":
+        section("dev holdings")
+        print(dim(f"  {pf.get('detail')}"))
+
     # -- name collisions -----------------------------------------------------
     nc = report.get("name_collisions")
     if nc and nc.get("status") == "ok":
@@ -2795,6 +3129,7 @@ def build_report(
     migration: Optional[MigrationStatus] = None,
     identity: Optional[TokenIdentity] = None,
     collisions: Optional[NameCollisions] = None,
+    portfolio: Optional[Portfolio] = None,
 ) -> dict:
     first = triage.timeline[0] if triage.timeline else None
     return {
@@ -2860,6 +3195,7 @@ def build_report(
         "risk": risk.to_dict() if risk else None,
         "migration": migration.to_dict() if migration else None,
         "name_collisions": collisions.to_dict() if collisions else None,
+        "dev_portfolio": portfolio.to_dict() if portfolio else None,
     }
 
 
@@ -2911,6 +3247,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="skip the mint/freeze authority + holder-concentration rug signal")
     p.add_argument("--no-name-check", action="store_true",
                    help="skip the search for other tokens using the same name")
+    p.add_argument("--no-portfolio", action="store_true",
+                   help="skip listing every token the dev wallet currently holds")
     p.add_argument("--time-budget", type=float, default=None,
                    help="wall-clock seconds for the whole run; optional on-chain "
                         "extras stand down (and say so) rather than overrun it. "
@@ -2989,91 +3327,21 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     # 1. zero point, straight from the chain
     if args.verbose:
         print(f"[1/3] resolving on-chain creation time via {args.rpc}", file=sys.stderr)
-    # Hold time back for the mention search only when one is actually going
-    # to run. With no credentials configured (or in mock mode) that reserve
-    # is time nothing will ever claim, and holding it would stand the
-    # on-chain extras down to protect a search that never happens.
-    will_search = provider != "none" and not getattr(args, "mock", False)
-    budget = TimeBudget(
-        getattr(args, "time_budget", None),
-        reserve=SEARCH_RESERVE if will_search else 0.0,
-    )
+    # The search runs before the extras (step 4), so nothing downstream of
+    # them needs protecting and the reserve is zero. TimeBudget still
+    # supports a reserve for callers that order these phases differently.
+    budget = TimeBudget(getattr(args, "time_budget", None), reserve=0.0)
     rpc = SolanaRPC(args.rpc, args.verbose)
     origin = resolve_origin(rpc, ca, args.sig_page_cap)
     origin_dt = utc_from_unix(origin.created_unix)
 
-    # 1b. on-chain extras: identity, first buyers, dev fingerprinting, rug
-    # signal, migration status. Each degrades independently and never aborts
-    # the run - these are context around the answer, not the answer itself.
-    #
-    # The mint account is fetched ONCE here and shared: the token's name and
-    # the rug signal both need it, and paying for it twice is exactly the
-    # kind of avoidable RPC cost this project keeps having to police.
+    # 1b. token identity. This one extra stays ahead of the search because
+    # the name check (step 4) needs it and it is nearly free - the mint
+    # account is fetched ONCE here and shared with the rug signal, since
+    # paying for the same account twice is exactly the kind of avoidable
+    # RPC cost this project keeps having to police.
     parsed_mint = _parsed_mint_info(rpc, ca)
     identity = resolve_token_identity(rpc, ca, parsed_mint)
-
-    buyers: list[BuyerActivity] = []
-    buyer_notes: list[str] = []
-    buyers_skipped = True
-    if not getattr(args, "no_first_buyers", False):
-        if budget.can_afford(COST_FIRST_BUYERS):
-            buyers, buyer_notes, buyers_skipped = find_first_buyers(
-                rpc, origin,
-                limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
-                scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
-            )
-        else:
-            buyer_notes.append(budget.note_skip("First-buyer scan"))
-
-    dev_profile: Optional[DevProfile] = None
-    if not getattr(args, "no_dev_scan", False):
-        if budget.can_afford(COST_DEV_SCAN):
-            dev_profile = find_other_launches(
-                rpc, origin.dev_wallet, ca,
-                signature_cap=getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP),
-                max_launches=getattr(args, "dev_scan_max_launches", DEFAULT_DEV_SCAN_MAX_LAUNCHES),
-            )
-        else:
-            # Still carry the wallet - it is already known from the genesis
-            # transaction and costs nothing. Only the history scan stands down.
-            dev_profile = DevProfile(
-                dev_wallet=origin.dev_wallet,
-                scan_exhausted=False,
-                scan_ran=False,
-                notes=[budget.note_skip("Dev history scan")],
-            )
-
-    risk: Optional[RiskAssessment] = None
-    migration: Optional[MigrationStatus] = None
-    if not getattr(args, "no_risk_check", False):
-        if budget.can_afford(COST_RISK_CHECK):
-            risk = assess_risk(rpc, ca, dev_profile, parsed_mint)
-            migration = check_migration(risk.top_holders)
-
-    # How much of this token the dev still holds - needs the supply from the
-    # risk pass, so it runs after it.
-    if dev_profile and dev_profile.dev_wallet:
-        if budget.can_afford(COST_DEV_HOLDING):
-            supply_ui = risk.supply_ui if risk else None
-            amount, pct, known = get_wallet_holding(rpc, dev_profile.dev_wallet, ca, supply_ui)
-            dev_profile.holding_amount = amount
-            dev_profile.holding_pct = pct
-            dev_profile.holding_known = known
-        else:
-            # holding_known stays False, which the renderers already show as
-            # "unknown" rather than as "the dev holds nothing".
-            dev_profile.notes.append(budget.note_skip("Dev holdings check"))
-
-    collisions: Optional[NameCollisions] = None
-    if not getattr(args, "no_name_check", False):
-        if budget.can_afford(COST_NAME_CHECK):
-            collisions = find_name_collisions(identity.name, ca, identity.symbol)
-        else:
-            collisions = NameCollisions(
-                status="unavailable", searched_name=identity.name,
-                searched_symbol=identity.symbol,
-                detail=budget.note_skip("Name check"),
-            )
 
     # 2. cross-check (advisory only, never load-bearing)
     cross = (
@@ -3148,6 +3416,92 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
             else:
                 outcome = stub("error", [str(exc)], client.requests_made, endpoint)
 
+    # 4. on-chain extras, with whatever time is left.
+    #
+    # These run AFTER the search on purpose. They are context around the
+    # answer, not the answer, so when the clock is tight the search must
+    # win - and it can only win by going first. While they ran first they
+    # had to hold a reserve back for a search that hadn't happened yet,
+    # which on a real deployment stood the dev scan down on every run.
+    # Running them second means no reserve to hold and the full remainder
+    # to spend.
+    buyers: list[BuyerActivity] = []
+    buyer_notes: list[str] = []
+    buyers_skipped = True
+    if not getattr(args, "no_first_buyers", False):
+        if budget.can_afford_calls(calls_for_first_buyers(getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP)), rpc):
+            buyers, buyer_notes, buyers_skipped = find_first_buyers(
+                rpc, origin,
+                limit=getattr(args, "first_buyers_limit", DEFAULT_FIRST_BUYERS_LIMIT),
+                scan_cap=getattr(args, "first_buyers_scan_cap", DEFAULT_FIRST_BUYERS_SCAN_CAP),
+            )
+        else:
+            buyer_notes.append(budget.note_skip("First-buyer scan"))
+
+    dev_profile: Optional[DevProfile] = None
+    if not getattr(args, "no_dev_scan", False):
+        if budget.can_afford_calls(calls_for_dev_scan(getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP)), rpc):
+            dev_profile = find_other_launches(
+                rpc, origin.dev_wallet, ca,
+                signature_cap=getattr(args, "dev_scan_cap", DEFAULT_DEV_SCAN_SIGNATURE_CAP),
+                max_launches=getattr(args, "dev_scan_max_launches", DEFAULT_DEV_SCAN_MAX_LAUNCHES),
+            )
+        else:
+            # Still carry the wallet - it is already known from the genesis
+            # transaction and costs nothing. Only the history scan stands down.
+            dev_profile = DevProfile(
+                dev_wallet=origin.dev_wallet,
+                scan_exhausted=False,
+                scan_ran=False,
+                notes=[budget.note_skip("Dev history scan")],
+            )
+
+    risk: Optional[RiskAssessment] = None
+    migration: Optional[MigrationStatus] = None
+    if not getattr(args, "no_risk_check", False):
+        if budget.can_afford_calls(CALLS_RISK_CHECK, rpc):
+            risk = assess_risk(rpc, ca, dev_profile, parsed_mint)
+            migration = check_migration(risk.top_holders)
+
+    # How much of this token the dev still holds - needs the supply from the
+    # risk pass, so it runs after it.
+    if dev_profile and dev_profile.dev_wallet:
+        if budget.can_afford_calls(CALLS_DEV_HOLDING, rpc):
+            supply_ui = risk.supply_ui if risk else None
+            amount, pct, known = get_wallet_holding(rpc, dev_profile.dev_wallet, ca, supply_ui)
+            dev_profile.holding_amount = amount
+            dev_profile.holding_pct = pct
+            dev_profile.holding_known = known
+        else:
+            # holding_known stays False, which the renderers already show as
+            # "unknown" rather than as "the dev holds nothing".
+            dev_profile.notes.append(budget.note_skip("Dev holdings check"))
+
+    # Everything else the dev wallet is holding right now. Same wallet, so
+    # it only runs when there is one, and it is the last extra in line -
+    # the most expensive and the least load-bearing of the set.
+    portfolio: Optional[Portfolio] = None
+    if dev_profile and dev_profile.dev_wallet and not getattr(args, "no_portfolio", False):
+        if budget.can_afford_calls(CALLS_DEV_PORTFOLIO, rpc):
+            portfolio = get_wallet_portfolio(rpc, dev_profile.dev_wallet, ca)
+        else:
+            portfolio = Portfolio(
+                status="unavailable", wallet=dev_profile.dev_wallet,
+                detail=budget.note_skip("Dev portfolio"),
+            )
+
+    collisions: Optional[NameCollisions] = None
+    if not getattr(args, "no_name_check", False):
+        if budget.can_afford_calls(CALLS_NAME_CHECK, rpc):
+            collisions = find_name_collisions(identity.name, ca, identity.symbol)
+        else:
+            collisions = NameCollisions(
+                status="unavailable", searched_name=identity.name,
+                searched_symbol=identity.symbol,
+                detail=budget.note_skip("Name check"),
+            )
+
+
     # Insider correlation: flag any mention whose own text contains one of
     # the first-buy wallet addresses, before triage sorts/filters mentions
     # into their categories - the flag needs to survive into whichever
@@ -3165,6 +3519,7 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
         migration=migration,
         identity=identity,
         collisions=collisions,
+        portfolio=portfolio,
     )
     return report, triage, outcome, origin, cross
 

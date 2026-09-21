@@ -85,7 +85,7 @@ api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
 api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
 firstcalloor.py      CLI wrapper around that same engine
 dev_server.py        local server mirroring Vercel's routing
-tests/               187 tests, no network or API key needed
+tests/               214 tests, no network or API key needed
 ```
 
 ---
@@ -236,7 +236,18 @@ whether the mention search ran, found anything, or has credits left.
   stdlib, like everything else here. This replaced pump.fun's API as the
   name source: that endpoint has returned HTTP 530 or 0 on *every* call this
   project has ever made to it, and the chain always has the answer.
-- **Dev holdings** — how much of this token the dev wallet still holds,
+- **Dev holdings (full portfolio)** — every token the dev wallet holds
+  right now, not just this one. Listed largest position first, where
+  "largest" means **share of each token's own supply** — the only
+  comparable number available without a price feed, since 10,000 of one
+  token and 10,000 of another are not comparable amounts while 4% of one
+  supply and 0.001% of another are. Ranking by dollar value would be
+  inventing precision this tool has no source for, so it doesn't.
+  Holdings are read from **both** token programs (classic SPL and
+  Token-2022) — querying only one would silently under-report. Names for
+  the largest positions are resolved in batched calls, not one per token.
+  Current balances only: a wallet that already sold shows nothing here.
+- **Dev holding of this token** — how much of this token the dev wallet still holds,
   summed across all of its token accounts for the mint. `holding_known` is
   the load-bearing field: `false` means the lookup did not complete, which
   is reported as "unknown", never as "the dev holds none of it". Those are
@@ -339,6 +350,7 @@ name comes off the chain for free:
 | `FIRSTCALLOOR_NO_DEV_SCAN` | off (runs) | `--no-dev-scan` |
 | `FIRSTCALLOOR_NO_RISK_CHECK` | off (runs) | `--no-risk-check` |
 | `FIRSTCALLOOR_NO_NAME_CHECK` | off (runs) | `--no-name-check` |
+| `FIRSTCALLOOR_NO_PORTFOLIO` | off (runs) | `--no-portfolio` |
 | `FIRSTCALLOOR_NO_CROSS_CHECK` | **on (skipped)** | `--no-cross-check` |
 | `FIRSTCALLOOR_FIRST_BUYERS_LIMIT` / `_SCAN_CAP` | `5` / `6` | `--first-buyers-limit` / `--first-buyers-scan-cap` (`10` / `20`) |
 | `FIRSTCALLOOR_DEV_SCAN_CAP` / `_MAX_LAUNCHES` | `8` / `2` | `--dev-scan-cap` / `--dev-scan-max-launches` (`40` / `8`) |
@@ -346,20 +358,38 @@ name comes off the chain for free:
 ### The time budget
 
 `HttpBudget` bounds any *single* request. `FIRSTCALLOOR_TIME_BUDGET`
-(default `7.5` seconds on the web path, unset/unlimited on the CLI) bounds
+(default `8.0` seconds on the web path, unset/unlimited on the CLI) bounds
 the **whole run**, which is a different failure mode: a dozen
 individually-fine RPC calls against a slow endpoint still add up past
 Vercel's 10s wall, and overrunning that wall isn't a slow page — the
 platform kills the process and the browser gets an opaque crash page
 instead of anything this code would have said.
 
-It matters most because the on-chain extras run *before* the mention
-search, so without a guard the bonus context can eat the budget and the
-actual answer — who called it first — never runs at all. Each extra has to
-show it can afford itself *and* leave the search its reserve, or it stands
-down. Measured against a slow public RPC (~0.6s per `getTransaction`), a
-full run costs ~19s; the budget brings that to ~7s by standing down on
-whatever doesn't fit.
+Two things make the budget spend well rather than just spend less:
+
+**The mention search runs before the on-chain extras.** The extras are
+context around the answer, not the answer, so when the clock is tight the
+search has to win — and it can only win by going first. While they ran
+first, they had to hold time back for a search that hadn't happened yet,
+and that reserve stood the dev scan down on deployments with plenty of
+time for it. Running them second means no reserve to hold and the whole
+remainder to spend.
+
+**Phase costs are counted in RPC round trips, priced by measured
+latency.** Seconds are a property of the endpoint, not of the work: a paid
+endpoint and the throttled public one differ by roughly an order of
+magnitude per call, so any fixed number of seconds is wrong for one of
+them — and erring pessimistic is what skipped checks that would have
+fit. Each phase declares how many calls it needs (counting the
+`getTransaction` version retry, which can double a scan's real cost), and
+the budget multiplies that by the latency it has actually observed this
+run, with a safety factor. Before anything has been timed it assumes a
+slow endpoint, since starting optimistic risks the wall while starting
+pessimistic only risks one extra.
+
+The effect, measured: against a throttled public endpoint at ~0.9s/call
+every scan correctly stands down and the run finishes in ~6s of its 8s;
+at a paid endpoint's ~0.06s/call all of them fit.
 
 A stand-down is always reported as **"not checked"**, never as a result.
 An unscanned dev wallet reports `scan_ran: false` and renders as "Not
@@ -388,6 +418,7 @@ it would be protecting a search that never happens.
 --no-dev-scan           skip the dev wallet's other-launches check
 --no-risk-check         skip the mint/freeze authority + holder-concentration signal
 --no-name-check         skip the search for other tokens using the same name
+--no-portfolio          skip listing every token the dev wallet currently holds
 --time-budget SECONDS   wall-clock cap for the whole run; optional extras stand
                         down (and say so) rather than overrun it. Unset =
                         unlimited, right for a terminal, never for serverless
@@ -436,7 +467,7 @@ and `search` metadata including every note about incompleteness.
 python -m unittest discover -s tests -v
 ```
 
-187 tests. X, twitterapi.io, DexScreener, and pump.fun are all stubbed at the HTTP layer,
+214 tests. X, twitterapi.io, DexScreener, and pump.fun are all stubbed at the HTTP layer,
 so the search strategy — window expansion, cap contraction, rate-limit
 cut-off, the 7-day clamp (and its absence on twitterapi.io) — is verified
 without network access or an API key. The on-chain extras (first buyers, dev

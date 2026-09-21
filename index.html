@@ -182,6 +182,7 @@
     font-weight:600; margin-left:6px; vertical-align:middle;
   }
   .tag.bad{background:var(--bad-bg); color:var(--bad)}
+  .item.mine{background:var(--warn-bg); border-radius:8px; padding-left:10px; margin-left:-10px}
   /* A plain tag (a lookalike, not a real collision) stays visually quiet. */
   .tag:not(.bad):not(.warn){background:var(--line-soft); color:var(--text-3)}
   .item-links .tag{margin-left:0; margin-right:8px}
@@ -510,6 +511,43 @@ function renderDev(d) {
   return card("Dev wallet", `<div class="rows">${rows.join("")}</div>${launches}${notes(dev.notes)}`);
 }
 
+/* ---------------- dev portfolio ---------------- */
+
+function renderPortfolio(d) {
+  const pf = d.dev_portfolio;
+  if (!pf || pf.status === "skipped") return "";
+  if (pf.status === "unavailable")
+    return card("Dev holdings", `<div class="empty">Couldn't check right now.</div>
+      <div class="fine">${esc(pf.detail || "")}</div>`);
+
+  if (!pf.total_positions)
+    return card("Dev holdings", `<div class="empty">This wallet holds no tokens right now.</div>
+      <div class="fine">${esc(pf.caveat)}</div>`);
+
+  const items = (pf.entries || []).map(e => `
+    <li class="item${e.is_this_token ? " mine" : ""}">
+      <div class="item-main">
+        <div class="item-top">
+          <span class="h">${esc(e.name || "Unnamed token")}${e.symbol ? ` <span class="meta">$${esc(e.symbol)}</span>` : ""}</span>
+          <span class="when t3">${e.pct_of_supply != null ? esc(e.pct_of_supply + "% of supply") : "share unknown"}</span>
+        </div>
+        <div class="item-text mono">${esc(shorten(e.mint, 6, 6))} · ${esc(fmtAmount(e.amount))} tokens</div>
+        <div class="item-links">
+          ${e.is_this_token ? `<span class="tag warn">this token</span>` : ""}
+          <a href="${esc(e.chart_url)}" target="_blank" rel="noopener">Chart ↗</a>
+        </div>
+      </div>
+    </li>`).join("");
+
+  const hidden = pf.total_positions - pf.shown;
+  return card(`Dev holdings (${pf.total_positions} token${pf.total_positions === 1 ? "" : "s"})`, `
+    <ul class="list">${items}</ul>
+    ${hidden > 0 ? `<div class="fine">… and ${hidden} smaller position${hidden === 1 ? "" : "s"} not shown.</div>` : ""}
+    ${pf.detail ? `<div class="note">${esc(pf.detail)}</div>` : ""}
+    <div class="fine">${esc(pf.caveat)}</div>
+  `);
+}
+
 /* ---------------- name collisions ---------------- */
 
 function renderNameCheck(d) {
@@ -649,6 +687,7 @@ async function run(ca) {
       renderTimeline(data) +
       renderFirstBuyers(data) +
       renderDev(data) +
+      renderPortfolio(data) +
       renderNameCheck(data) +
       renderFlagged(data) +
       renderSearchDetail(data);

@@ -88,6 +88,7 @@ WEB_NO_FIRST_BUYERS = os.environ.get("FIRSTCALLOOR_NO_FIRST_BUYERS", "0").lower(
 WEB_NO_DEV_SCAN = os.environ.get("FIRSTCALLOOR_NO_DEV_SCAN", "0").lower() in ("1", "true", "yes", "on")
 WEB_NO_RISK_CHECK = os.environ.get("FIRSTCALLOOR_NO_RISK_CHECK", "0").lower() in ("1", "true", "yes", "on")
 WEB_NO_NAME_CHECK = os.environ.get("FIRSTCALLOOR_NO_NAME_CHECK", "0").lower() in ("1", "true", "yes", "on")
+WEB_NO_PORTFOLIO = os.environ.get("FIRSTCALLOOR_NO_PORTFOLIO", "0").lower() in ("1", "true", "yes", "on")
 # pump.fun's API has returned 530 on every single call this project has ever
 # made to it, and a hanging attempt can eat 6s of a ~10s budget for an
 # advisory timestamp cross-check. The token name - the only thing it gave
@@ -102,7 +103,7 @@ WEB_NO_CROSS_CHECK = os.environ.get("FIRSTCALLOOR_NO_CROSS_CHECK", "1").lower() 
 # run, which is the different failure of many individually-fine calls adding
 # up. The default leaves ~2.5s of headroom for process start, JSON encoding
 # and the response itself.
-WEB_TIME_BUDGET = float(os.environ.get("FIRSTCALLOOR_TIME_BUDGET", "7.5"))
+WEB_TIME_BUDGET = float(os.environ.get("FIRSTCALLOOR_TIME_BUDGET", "8.0"))
 
 
 def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
@@ -121,6 +122,7 @@ def web_args(include_retweets: bool, full_archive: bool) -> argparse.Namespace:
         no_dev_scan=WEB_NO_DEV_SCAN,
         no_risk_check=WEB_NO_RISK_CHECK,
         no_name_check=WEB_NO_NAME_CHECK,
+        no_portfolio=WEB_NO_PORTFOLIO,
         time_budget=WEB_TIME_BUDGET,
         first_buyers_limit=WEB_FIRST_BUYERS_LIMIT,
         first_buyers_scan_cap=WEB_FIRST_BUYERS_SCAN_CAP,
