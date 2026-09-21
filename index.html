@@ -182,6 +182,9 @@
     font-weight:600; margin-left:6px; vertical-align:middle;
   }
   .tag.bad{background:var(--bad-bg); color:var(--bad)}
+  /* A plain tag (a lookalike, not a real collision) stays visually quiet. */
+  .tag:not(.bad):not(.warn){background:var(--line-soft); color:var(--text-3)}
+  .item-links .tag{margin-left:0; margin-right:8px}
   .tag.warn{background:var(--warn-bg); color:var(--warn)}
 
   /* ---------- notes ---------- */
@@ -350,10 +353,19 @@ function renderRisk(d) {
       r.freeze_authority_revoked ? `<span class="ok">No</span>` : `<span class="bad">Yes</span>`,
       r.freeze_authority_revoked ? "Freeze authority revoked" : "Freeze authority still active — holders can be locked"));
   }
-  if (r.top10_holder_pct !== null) {
+  // Counts individual wallets only. The bonding curve and AMM pools hold
+  // most of a young token's supply by design, and including them made every
+  // token read as 90-100% concentrated - a number about the launch
+  // mechanism, not about anyone's position.
+  if (r.top10_holder_pct != null) {
     const p = r.top10_holder_pct;
     const cls = p > 70 ? "bad" : p > 40 ? "warn" : "ok";
-    rows.push(row("Top 10 wallets hold", `<span class="${cls}">${p}%</span>`, "of total supply"));
+    rows.push(row("Biggest wallets hold", `<span class="${cls}">${p}%</span>`,
+      "of total supply, counting individual wallets only"));
+  }
+  if (r.pooled_pct != null) {
+    rows.push(row("In the curve / pool", `<span class="t3">${r.pooled_pct}%</span>`,
+      "Unsold supply held by the bonding curve or an AMM pool — not an insider position"));
   }
   if (d.migration && d.migration.migrated) {
     rows.push(row("Trading on", `<span class="ok">${esc(d.migration.venue)}</span>`, "Graduated from the bonding curve"));
@@ -507,31 +519,50 @@ function renderNameCheck(d) {
     return card("Name check", `<div class="empty">Couldn't check right now.</div><div class="fine">${esc(nc.detail || "")}</div>`);
   if (nc.status === "skipped") return "";
 
+  const searched = [nc.searched_name, nc.searched_symbol ? "$" + nc.searched_symbol : null]
+    .filter(Boolean).join(" / ");
+
   if (!nc.count)
-    return card("Name check", `<div class="empty"><span class="ok">No other Solana token is using this name.</span></div>`);
+    return card("Name check", `
+      <div class="empty"><span class="ok">No other Solana token is using this name or ticker.</span></div>
+      <div class="fine">Searched for ${esc(searched)}, including respellings and lookalikes.</div>`);
+
+  const twins = nc.twins || [];
+  const real = nc.impersonation_count || 0;
+  // A token that actually holds the name is a different warning from one
+  // that merely resembles it, so the heading counts the real ones.
+  const heading = real
+    ? `Name check (${real} token${real === 1 ? "" : "s"} already using this identity)`
+    : `Name check (${nc.count} lookalike${nc.count === 1 ? "" : "s"})`;
 
   const oldest = nc.oldest;
-  const rest = (nc.twins || []).filter(t => !oldest || t.mint !== oldest.mint).slice(0, 5);
-  return card(`Name check (${nc.count} other token${nc.count === 1 ? "" : "s"} with this name)`, `
+  const items = twins.slice(0, 8).map(t => `
+    <li class="item">
+      <div class="item-main">
+        <div class="item-top">
+          <span class="h mono">${esc(shorten(t.mint, 6, 6))}</span>
+          <span class="meta">${esc(t.name || "")}${t.symbol ? ` · $${esc(t.symbol)}` : ""}</span>
+          ${dateCell(t.first_pair_seen, "t3")}
+        </div>
+        <div class="item-links">
+          <span class="tag ${t.is_impersonation ? "warn" : ""}">${esc(t.match || "similar")}</span>
+          <a href="${esc(t.chart_url)}" target="_blank" rel="noopener">Chart ↗</a>
+        </div>
+      </div>
+    </li>`).join("");
+
+  return card(heading, `
     ${oldest ? `
-      <div class="note warn">An older token already uses the name
-        <strong>${esc(oldest.name || nc.searched_name)}</strong> — first traded
+      <div class="note warn">An older token already uses this identity —
+        <strong>${esc(oldest.name || nc.searched_name)}</strong>${
+          oldest.symbol ? ` ($${esc(oldest.symbol)})` : ""}, first traded
         <span title="${esc(oldest.first_pair_seen || "")}">${esc(fmtDate(oldest.first_pair_seen) || "at an unknown date")}</span>${
-          timeAgo(oldest.first_pair_seen) ? ` (${timeAgo(oldest.first_pair_seen)})` : ""}.</div>` : ""}
-    <ul class="list" style="margin-top:12px">
-      ${(oldest ? [oldest, ...rest] : rest).map(t => `
-        <li class="item">
-          <div class="item-main">
-            <div class="item-top">
-              <span class="h mono">${esc(shorten(t.mint, 6, 6))}</span>
-              <span class="meta">${esc(t.symbol ? "$" + t.symbol : "")}</span>
-              ${dateCell(t.first_pair_seen, "t3")}
-            </div>
-            <div class="item-links"><a href="${esc(t.chart_url)}" target="_blank" rel="noopener">Chart ↗</a></div>
-          </div>
-        </li>`).join("")}
-    </ul>
-    <div class="fine">${esc(nc.caveat)}</div>
+          timeAgo(oldest.first_pair_seen) ? ` (${timeAgo(oldest.first_pair_seen)})` : ""}.</div>`
+    : `<div class="fine" style="margin:0 0 12px">Nothing holds this exact name or ticker — the tokens below only resemble it.</div>`}
+    <ul class="list" style="margin-top:12px">${items}</ul>
+    <div class="fine">Searched ${esc(searched)} across names and tickers, including
+      respellings (<span class="mono">S0LANA</span>) and one-character lookalikes.
+      ${esc(nc.caveat)}${nc.detail ? " " + esc(nc.detail) : ""}</div>
   `);
 }
 

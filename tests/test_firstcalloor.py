@@ -1192,7 +1192,8 @@ class TestAssessRisk(unittest.TestCase):
         rpc = ScriptedRPC({
             "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000", decimals=6),
             "getTokenLargestAccounts": lambda p: {"value": holders},
-            "getMultipleAccounts": lambda p: {"value": [None]},
+            "getMultipleAccounts": lambda p: {"value": [
+                {"data": {"parsed": {"info": {"owner": "ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci"}}}}]},
         })
         risk = fc.assess_risk(rpc, VALID_CA, None)
         self.assertEqual(risk.verdict, "elevated_risk")
@@ -1203,7 +1204,8 @@ class TestAssessRisk(unittest.TestCase):
         rpc = ScriptedRPC({
             "getAccountInfo": lambda p: self._mint_info_response(None, None, supply="1000000000000", decimals=6),
             "getTokenLargestAccounts": lambda p: {"value": holders},
-            "getMultipleAccounts": lambda p: {"value": [None]},
+            "getMultipleAccounts": lambda p: {"value": [
+                {"data": {"parsed": {"info": {"owner": "ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci"}}}}]},
         })
         risk = fc.assess_risk(rpc, VALID_CA, None)
         self.assertEqual(risk.verdict, "some_risk_signals")
@@ -1264,7 +1266,10 @@ class TestGetTopHolders(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIsNotNone(note)
 
-    def test_owner_resolution_failure_keeps_amounts(self):
+    def test_owner_resolution_failure_keeps_amounts_but_warns(self):
+        # The amounts are still real, but with no owner the bonding curve
+        # can't be told from a whale - so this must NOT quietly produce a
+        # concentration number built on unclassified accounts.
         holders = [{"address": "acc1", "uiAmount": 42.0}]
 
         def boom(params):
@@ -1275,7 +1280,8 @@ class TestGetTopHolders(unittest.TestCase):
             "getMultipleAccounts": boom,
         })
         result, note = fc.get_top_holders(rpc, VALID_CA, supply_ui=100.0)
-        self.assertIsNone(note)
+        self.assertIsNotNone(note)
+        self.assertIn("told apart from real wallets", note)
         self.assertEqual(len(result), 1)
         self.assertIsNone(result[0].owner)
         self.assertEqual(result[0].amount_ui, 42.0)
@@ -1734,6 +1740,304 @@ class TestSkippedScanIsNotACleanResult(unittest.TestCase):
         })
         risk = fc.assess_risk(rpc, VALID_CA, fc.DevProfile(dev_wallet="DevWallet1"))
         self.assertFalse(any("not checked" in n for n in risk.notes))
+
+
+# --------------------------------------------------------------------------
+# holder concentration - wallets vs. the launch mechanism
+# --------------------------------------------------------------------------
+
+class TestClassifyHolderOwner(unittest.TestCase):
+    def test_known_amm_program_is_named(self):
+        raydium = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+        self.assertEqual(fc.classify_holder_owner(raydium), (True, "Raydium AMM v4"))
+
+    def test_pump_fun_bonding_curve_is_program_owned(self):
+        # The curve holds essentially the whole supply of a young token; if
+        # it counts as a holder, every token reads as ~100% concentrated.
+        curve = fc.find_program_address(
+            [b"bonding-curve", fc.b58_decode(VALID_CA)], fc.PUMP_FUN_PROGRAM_ID)
+        is_program, venue = fc.classify_holder_owner(curve)
+        self.assertTrue(is_program)
+        self.assertEqual(venue, "bonding curve or program vault")
+
+    def test_raydium_pool_authority_is_program_owned(self):
+        # A PDA, so off the ed25519 curve, so not a wallet anyone can sign for.
+        is_program, _ = fc.classify_holder_owner("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1")
+        self.assertTrue(is_program)
+
+    def test_a_real_wallet_is_not_program_owned(self):
+        self.assertEqual(
+            fc.classify_holder_owner("ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci"),
+            (False, None))
+
+    def test_missing_owner_is_not_assumed_to_be_a_program(self):
+        self.assertEqual(fc.classify_holder_owner(None), (False, None))
+
+    def test_undecodable_owner_does_not_raise(self):
+        self.assertEqual(fc.classify_holder_owner("not-base58-0OIl"), (False, None))
+
+
+def largest_accounts(*entries):
+    """entries: (token_account, owner, ui_amount)"""
+    return {"value": [{"address": ta, "uiAmount": amt} for ta, _, amt in entries]}
+
+
+def owner_accounts(*entries):
+    return {"value": [
+        {"data": {"parsed": {"info": {"owner": owner}}}} for _, owner, _ in entries
+    ]}
+
+
+def mint_account(supply="1000000000", decimals=0, mint_auth=None, freeze_auth=None):
+    return {"value": {"data": {"parsed": {"info": {
+        "decimals": decimals, "supply": supply,
+        "mintAuthority": mint_auth, "freezeAuthority": freeze_auth}}}}}
+
+
+class TestConcentrationExcludesTheLaunchMechanism(unittest.TestCase):
+    def setUp(self):
+        self.curve = fc.find_program_address(
+            [b"bonding-curve", fc.b58_decode(VALID_CA)], fc.PUMP_FUN_PROGRAM_ID)
+        self.wallet_a = "ChReo21irgNsRVi5TPvaXgnwxSNnsKJ7Lt1bpAiME8ci"
+        self.wallet_b = "8mvXGkM7RJky5JcZ2TjhjEkmqAiPLPiTT9h9TJgLnV7V"
+
+    def _risk(self, entries):
+        return fc.assess_risk(ScriptedRPC({
+            "getAccountInfo": mint_account(),
+            "getTokenLargestAccounts": largest_accounts(*entries),
+            "getMultipleAccounts": owner_accounts(*entries),
+        }), VALID_CA, None)
+
+    def test_bonding_curve_supply_is_not_counted_as_concentration(self):
+        # 90% in the curve, 3% across two wallets. The old behaviour reported
+        # 93% and flagged every single token as elevated risk.
+        risk = self._risk([
+            ("TokenAcctCurve", self.curve, 900_000_000),
+            ("TokenAcctA", self.wallet_a, 20_000_000),
+            ("TokenAcctB", self.wallet_b, 10_000_000),
+        ])
+        self.assertEqual(risk.top10_pct, 3.0)
+        self.assertEqual(risk.pooled_pct, 90.0)
+
+    def test_pooled_supply_is_explained_rather_than_hidden(self):
+        risk = self._risk([
+            ("TokenAcctCurve", self.curve, 900_000_000),
+            ("TokenAcctA", self.wallet_a, 20_000_000),
+        ])
+        self.assertTrue(any("excluded from the concentration" in n for n in risk.notes))
+
+    def test_a_curve_heavy_token_is_no_longer_elevated_risk(self):
+        risk = self._risk([
+            ("TokenAcctCurve", self.curve, 990_000_000),
+            ("TokenAcctA", self.wallet_a, 1_000_000),
+        ])
+        self.assertEqual(risk.verdict, "no_major_red_flags")
+
+    def test_genuine_wallet_concentration_still_flags(self):
+        # Same 99% total, but held by actual wallets this time.
+        risk = self._risk([
+            ("TokenAcctA", self.wallet_a, 800_000_000),
+            ("TokenAcctB", self.wallet_b, 190_000_000),
+        ])
+        self.assertEqual(risk.top10_pct, 99.0)
+        self.assertIsNone(risk.pooled_pct)
+        self.assertEqual(risk.verdict, "elevated_risk")
+
+    def test_unresolvable_owners_report_no_figure_rather_than_a_wrong_one(self):
+        # Without owners, an unclassified bonding curve counts as a whale -
+        # exactly the 90-100% false alarm this classification exists to stop.
+        def boom(params):
+            raise fc.FirstCallooorError("rate limited")
+
+        risk = fc.assess_risk(ScriptedRPC({
+            "getAccountInfo": mint_account(),
+            "getTokenLargestAccounts": largest_accounts(
+                ("TokenAcctCurve", self.curve, 990_000_000)),
+            "getMultipleAccounts": boom,
+        }), VALID_CA, None)
+        self.assertIsNone(risk.top10_pct)
+        self.assertIsNone(risk.pooled_pct)
+        self.assertNotEqual(risk.verdict, "elevated_risk")
+
+    def test_all_pooled_reports_no_wallet_figure_rather_than_zero(self):
+        # Nothing but the curve: "0% concentration" would read as a clean
+        # bill of health for a token nobody holds yet.
+        risk = self._risk([("TokenAcctCurve", self.curve, 1_000_000_000)])
+        self.assertIsNone(risk.top10_pct)
+        self.assertEqual(risk.pooled_pct, 100.0)
+        self.assertTrue(any("no wallet-concentration figure" in n for n in risk.notes))
+
+
+# --------------------------------------------------------------------------
+# name / ticker lookalikes
+# --------------------------------------------------------------------------
+
+class TestClassifyNameMatch(unittest.TestCase):
+    def m(self, tn, ts, name="Dons", symbol="DONS"):
+        return fc.classify_name_match(name, symbol, tn, ts)
+
+    def test_exact_name(self):
+        self.assertEqual(self.m("Dons", "OTHER"), fc.MATCH_SAME_NAME)
+
+    def test_exact_ticker(self):
+        self.assertEqual(self.m("Totally Different", "DONS"), fc.MATCH_SAME_TICKER)
+
+    def test_case_is_ignored(self):
+        self.assertEqual(self.m("dOnS", "xxx"), fc.MATCH_SAME_NAME)
+
+    def test_leading_dollar_on_a_ticker_is_ignored(self):
+        self.assertEqual(self.m("Other", "$DONS"), fc.MATCH_SAME_TICKER)
+
+    def test_our_name_against_their_ticker(self):
+        # The swap is a common dodge: same identity, different field.
+        self.assertEqual(
+            fc.classify_name_match("Dons", None, "Unrelated", "Dons"),
+            fc.MATCH_SAME_TICKER)
+
+    def test_punctuation_and_spacing_respelling(self):
+        self.assertEqual(self.m("D.O.N.S", "xxx"), fc.MATCH_RESPELLED_NAME)
+
+    def test_digit_for_letter_respelling(self):
+        self.assertEqual(
+            fc.classify_name_match("Solana", "SOL", "S0LANA", "xxx"),
+            fc.MATCH_RESPELLED_NAME)
+
+    def test_doubled_letter_respelling(self):
+        self.assertEqual(self.m("Donss", "xxx"), fc.MATCH_RESPELLED_NAME)
+
+    def test_one_edit_is_a_lookalike_not_a_collision(self):
+        kind = fc.classify_name_match("Popcat", "POPCAT", "Popcats", "PPCT")
+        self.assertIn(kind, (fc.MATCH_LOOKALIKE_NAME, fc.MATCH_RESPELLED_NAME))
+
+    def test_unrelated_token_is_not_a_match(self):
+        self.assertIsNone(self.m("Bonk", "BONK"))
+
+    def test_short_tickers_do_not_fuzzy_match(self):
+        # At 2-3 characters nearly everything is one edit from everything
+        # else; fuzzy matching there would flag half the chain.
+        self.assertIsNone(fc.classify_name_match("AI", "AI", "AJ", "AJ"))
+
+    def test_exact_match_still_counts_on_a_short_ticker(self):
+        self.assertEqual(
+            fc.classify_name_match("AI Thing", "AI", "Other", "ai"),
+            fc.MATCH_SAME_TICKER)
+
+    def test_impersonation_set_excludes_mere_lookalikes(self):
+        self.assertIn(fc.MATCH_SAME_NAME, fc.IMPERSONATION_MATCHES)
+        self.assertIn(fc.MATCH_RESPELLED_TICKER, fc.IMPERSONATION_MATCHES)
+        self.assertNotIn(fc.MATCH_LOOKALIKE_NAME, fc.IMPERSONATION_MATCHES)
+
+
+class TestNameCollisionsWithLookalikes(unittest.TestCase):
+    def setUp(self):
+        self.original = fc.http_json
+        self.requested = []
+
+    def tearDown(self):
+        fc.http_json = self.original
+
+    def stub(self, by_query):
+        """by_query: query string -> payload or Exception."""
+        def fake(url, **kwargs):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("q", [""])[0]
+            self.requested.append(q)
+            payload = by_query.get(q, {"pairs": []})
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        fc.http_json = fake
+
+    def test_searches_both_the_name_and_the_ticker(self):
+        self.stub({})
+        fc.find_name_collisions("Dons Coin", VALID_CA, "DONS")
+        self.assertEqual(self.requested, ["Dons Coin", "DONS"])
+
+    def test_does_not_search_the_same_term_twice(self):
+        # DexScreener's search is case-insensitive, so a name and ticker
+        # that differ only in case are one query, not two wasted requests.
+        self.stub({})
+        fc.find_name_collisions("DONS", VALID_CA, "dons")
+        self.assertEqual(self.requested, ["DONS"])
+
+    def test_finds_a_ticker_copy_the_name_search_would_miss(self):
+        self.stub({"DONS": {"pairs": [pair("TickerCopy", name="Completely Other", symbol="DONS")]}})
+        result = fc.find_name_collisions("Dons Coin", VALID_CA, "DONS")
+        self.assertEqual([t.mint for t in result.twins], ["TickerCopy"])
+        self.assertEqual(result.twins[0].match, fc.MATCH_SAME_TICKER)
+
+    def test_labels_why_each_twin_matched(self):
+        self.stub({"Dons": {"pairs": [
+            pair("Exact1", name="Dons", symbol="DONS", created_ms=1_600_000_000_000),
+            pair("Respelled1", name="D0ns", symbol="XXX", created_ms=1_650_000_000_000),
+        ]}})
+        result = fc.find_name_collisions("Dons", VALID_CA, "DONS")
+        by_mint = {t.mint: t.match for t in result.twins}
+        self.assertEqual(by_mint["Exact1"], fc.MATCH_SAME_NAME)
+        self.assertEqual(by_mint["Respelled1"], fc.MATCH_RESPELLED_NAME)
+
+    def test_real_collisions_sort_above_mere_lookalikes(self):
+        self.stub({"Dons": {"pairs": [
+            pair("Lookalike1", name="Donsy", symbol="XXX", created_ms=1_400_000_000_000),
+            pair("Exact1", name="Dons", symbol="DONS", created_ms=1_600_000_000_000),
+        ]}})
+        result = fc.find_name_collisions("Dons", VALID_CA, "DONS")
+        # Lookalike1 is older, but an outright collision is the thing to see.
+        self.assertEqual(result.twins[0].mint, "Exact1")
+
+    def test_oldest_is_a_real_collision_not_an_older_lookalike(self):
+        self.stub({"Dons": {"pairs": [
+            pair("Lookalike1", name="Donsy", symbol="XXX", created_ms=1_400_000_000_000),
+            pair("Exact1", name="Dons", symbol="DONS", created_ms=1_600_000_000_000),
+        ]}})
+        result = fc.find_name_collisions("Dons", VALID_CA, "DONS")
+        self.assertEqual(result.oldest.mint, "Exact1")
+
+    def test_no_oldest_when_only_lookalikes_were_found(self):
+        # Nothing here actually holds the name, so there is no "an older
+        # token already uses this name" claim to make.
+        self.stub({"Dons": {"pairs": [pair("Lookalike1", name="Donsy", symbol="XXX")]}})
+        result = fc.find_name_collisions("Dons", VALID_CA, "DONS")
+        self.assertEqual(len(result.twins), 1)
+        self.assertIsNone(result.oldest)
+
+    def test_one_failed_search_degrades_to_a_partial_list_not_unavailable(self):
+        self.stub({
+            "Dons Coin": {"pairs": [pair("Exact1", name="Dons Coin", symbol="DONS")]},
+            "DONS": fc.HttpError(429, "slow down", fc.DEXSCREENER_SEARCH),
+        })
+        result = fc.find_name_collisions("Dons Coin", VALID_CA, "DONS")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([t.mint for t in result.twins], ["Exact1"])
+        self.assertIn("may be incomplete", result.detail)
+
+    def test_both_searches_failing_is_unavailable(self):
+        err = fc.HttpError(403, "blocked", fc.DEXSCREENER_SEARCH)
+        self.stub({"Dons Coin": err, "DONS": err})
+        result = fc.find_name_collisions("Dons Coin", VALID_CA, "DONS")
+        self.assertEqual(result.status, "unavailable")
+
+    def test_skipped_without_a_name_or_a_ticker(self):
+        self.stub({})
+        result = fc.find_name_collisions(None, VALID_CA, None)
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(self.requested, [])
+
+    def test_runs_on_a_ticker_alone(self):
+        self.stub({"DONS": {"pairs": [pair("Exact1", name="Other", symbol="DONS")]}})
+        result = fc.find_name_collisions(None, VALID_CA, "DONS")
+        self.assertEqual([t.mint for t in result.twins], ["Exact1"])
+
+    def test_serialised_result_breaks_down_the_match_kinds(self):
+        self.stub({"Dons": {"pairs": [
+            pair("Exact1", name="Dons", symbol="DONS"),
+            pair("Look1", name="Donsy", symbol="XXX"),
+        ]}})
+        payload = fc.find_name_collisions("Dons", VALID_CA, "DONS").to_dict()
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["impersonation_count"], 1)
+        self.assertEqual(payload["match_breakdown"][fc.MATCH_SAME_NAME], 1)
+        self.assertTrue(payload["twins"][0]["is_impersonation"])
 
 
 if __name__ == "__main__":

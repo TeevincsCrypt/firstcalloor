@@ -85,7 +85,7 @@ api/analyze.py       serverless endpoint: GET /api/analyze?ca=<CA>
 api/_engine.py       the engine (underscore = bundled by Vercel, not routed)
 firstcalloor.py      CLI wrapper around that same engine
 dev_server.py        local server mirroring Vercel's routing
-tests/               150 tests, no network or API key needed
+tests/               187 tests, no network or API key needed
 ```
 
 ---
@@ -241,15 +241,39 @@ whether the mention search ran, found anything, or has credits left.
   the load-bearing field: `false` means the lookup did not complete, which
   is reported as "unknown", never as "the dev holds none of it". Those are
   very different claims to make about a dev wallet.
-- **Name check** — other Solana tokens already using this name, oldest
-  first. Reusing the name of a token that already ran is a standard
-  impersonation play, so knowing an older token holds the name is exactly
-  the context "is this the real one?" needs. There is no on-chain index of
-  token names, so this uses DexScreener's public search endpoint (no key).
-  Its timestamps are labelled for what they actually are — **first DEX pair
-  seen, not mint creation**; a token can live on a bonding curve well before
-  it has a pair. Loose substring matches are discarded: only an exact name
-  or symbol hit counts. Unreachable endpoint degrades to `unavailable`.
+- **Name check** — other Solana tokens sharing *or imitating* this token's
+  identity. Reusing a name that already ran is a standard impersonation
+  play; so is keeping the ticker while changing the name, and so is
+  respelling either one. All of those are the same attack on someone
+  scrolling a feed, so all of them are searched:
+
+  | Checked | Example against `Dons` / `$DONS` |
+  |---|---|
+  | Same name | `Dons` |
+  | Same ticker | `Dons Official` / `$DONS` |
+  | Name ↔ ticker swap | a token *named* `DONS` |
+  | Respelled (case, spacing, punctuation) | `D.O.N.S`, `dons` |
+  | Respelled (confusable characters) | `D0ns`, `S0LANA` for `SOLANA` |
+  | Doubled letters | `Donss` |
+  | One-character lookalike | `Donsy` |
+
+  Both the name **and** the ticker are searched — a copycat usually keeps
+  the ticker, since that's the part people type. Every result says *which*
+  kind of match it is, because an outright collision and a mere lookalike
+  are different claims: only a real collision ("same name", "same ticker",
+  or a respelling of either) triggers the "an older token already uses this
+  identity" headline, and real collisions sort above lookalikes so a
+  resemblance can never push a genuine one off the list. Fuzzy matching is
+  disabled below 4 characters — on a 2–3 character ticker nearly everything
+  is one edit from everything else, and a check that cries wolf gets ignored
+  exactly when it matters.
+
+  There is no on-chain index of token names, so this uses DexScreener's
+  public search endpoint (no key). Timestamps are labelled for what they
+  actually are — **first DEX pair seen, not mint creation**; a token can
+  live on a bonding curve well before it has a pair. If one of the two
+  searches fails, the partial list is shown *and says it's partial*; only a
+  total failure degrades to `unavailable`.
 - **First buyers** — the earliest wallets to receive tokens after genesis.
   A wallet counts as a buyer when its own token balance for the mint
   increases between a transaction's pre- and post-state; the transaction's
@@ -262,10 +286,22 @@ whether the mention search ran, found anything, or has credits left.
   audit) and reported as such — a dev's full lifetime history can run into
   thousands of transactions, and this project has repeatedly had to rein in
   unbounded RPC cost elsewhere (search pacing, retry budgets).
-- **Rug signal** — mint/freeze authority status plus top-10 holder
+- **Rug signal** — mint/freeze authority status plus holder
   concentration, combined into a verdict (`elevated_risk` /
   `some_risk_signals` / `no_major_red_flags` / `unknown`) with the
-  underlying evidence always shown, never a bare yes/no. Built entirely from
+  underlying evidence always shown, never a bare yes/no. **Concentration
+  counts individual wallets only.** `getTokenLargestAccounts` returns the
+  largest *token accounts*, and for a pump.fun token the largest by far is
+  the bonding curve itself — it starts holding essentially the entire
+  supply and releases it as people buy; after graduation the AMM pool holds
+  the same position. Counting those made every token read as 90–100%
+  concentrated, which describes the launch mechanism rather than any
+  insider. They're identified for free, with no extra RPC call: a user
+  wallet is an ed25519 public key and lies *on* the curve, while a
+  program-derived address is *off* it by construction, so the curve check
+  separates vaults from wallets without hardcoding anyone's program layout.
+  Known AMM programs are additionally named. Pooled supply is reported on
+  its own row, not hidden. Built entirely from
   standard SPL Token Program fields — not pump.fun-internal contract
   details — so it doesn't carry the "unverified against a live contract"
   risk the liquidity/MC simulator would (see below). **Heuristic, not
@@ -400,7 +436,7 @@ and `search` metadata including every note about incompleteness.
 python -m unittest discover -s tests -v
 ```
 
-150 tests. X, twitterapi.io, DexScreener, and pump.fun are all stubbed at the HTTP layer,
+187 tests. X, twitterapi.io, DexScreener, and pump.fun are all stubbed at the HTTP layer,
 so the search strategy — window expansion, cap contraction, rate-limit
 cut-off, the 7-day clamp (and its absence on twitterapi.io) — is verified
 without network access or an API key. The on-chain extras (first buyers, dev

@@ -88,7 +88,7 @@ COST_FIRST_BUYERS = 3.0
 COST_DEV_SCAN = 3.5
 COST_RISK_CHECK = 1.0
 COST_DEV_HOLDING = 0.6
-COST_NAME_CHECK = 1.0
+COST_NAME_CHECK = 1.8   # two searches: the name and the ticker
 # What the mention search itself needs: one to three HTTP calls with pacing
 # between them. This is the reserve every optional phase must leave behind.
 SEARCH_RESERVE = 4.0
@@ -979,6 +979,10 @@ class HolderInfo:
     token_account: str
     amount_ui: float
     pct_of_supply: Optional[float]
+    # Program-controlled accounts are NOT holders in the risk sense - see
+    # classify_holder_owner() for why this distinction is load-bearing.
+    is_program_owned: bool = False
+    venue: Optional[str] = None       # e.g. "Raydium AMM v4", "bonding curve or program vault"
 
     def to_dict(self) -> dict:
         return {
@@ -986,7 +990,45 @@ class HolderInfo:
             "token_account": self.token_account,
             "amount": self.amount_ui,
             "pct_of_supply": self.pct_of_supply,
+            "is_program_owned": self.is_program_owned,
+            "venue": self.venue,
         }
+
+
+def classify_holder_owner(owner: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Is this token-account owner a person's wallet, or a program's vault?
+
+    This is the difference between a real concentration warning and a
+    meaningless one. getTokenLargestAccounts returns the largest TOKEN
+    ACCOUNTS, and for a pump.fun token the largest by far is the bonding
+    curve itself - it starts holding essentially the entire supply and only
+    releases it as people buy. After graduation the AMM pool holds the same
+    position. Counting those as "top holders" makes every single token look
+    90-100% concentrated, which is both alarming and useless: it describes
+    the launch mechanism, not any insider.
+
+    A user wallet is an ed25519 public key, so it lies ON the curve. A
+    program-derived address cannot be signed for and is OFF the curve by
+    construction - that is the whole point of a PDA. Bonding curves, AMM
+    vaults and escrows are all PDAs, so the curve check separates them from
+    real wallets for free, with no extra RPC call and without hardcoding
+    anyone's program layout. Known AMM programs are additionally named, so
+    the report can say "in the Raydium pool" rather than just "a program".
+
+    Returns (is_program_owned, venue_label).
+    """
+    if not owner:
+        return False, None
+    venue = KNOWN_AMM_PROGRAMS.get(owner)
+    if venue:
+        return True, venue
+    try:
+        on_curve = _is_on_ed25519_curve(b58_decode(owner))
+    except ValueError:
+        return False, None
+    if not on_curve:
+        return True, "bonding curve or program vault"
+    return False, None
 
 
 @dataclass
@@ -997,7 +1039,8 @@ class RiskAssessment:
     freeze_authority_revoked: Optional[bool]
     supply_ui: Optional[float]
     top_holders: list[HolderInfo] = field(default_factory=list)
-    top10_pct: Optional[float] = None
+    top10_pct: Optional[float] = None      # individual wallets only
+    pooled_pct: Optional[float] = None     # bonding curve / AMM pools, reported separately
     dev_other_launches: int = 0
     verdict: str = "unknown"      # elevated_risk | some_risk_signals | no_major_red_flags | unknown
     reasons: list[str] = field(default_factory=list)
@@ -1011,6 +1054,7 @@ class RiskAssessment:
             "freeze_authority_revoked": self.freeze_authority_revoked,
             "supply": self.supply_ui,
             "top10_holder_pct": self.top10_pct,
+            "pooled_pct": self.pooled_pct,
             "top_holders": [h.to_dict() for h in self.top_holders],
             "dev_other_launches": self.dev_other_launches,
             "notes": self.notes,
@@ -1180,17 +1224,33 @@ def get_top_holders(
                     if owner:
                         owners_by_address[address] = owner
         except FirstCallooorError:
-            pass  # owners stay unresolved; amounts/percentages are still valid without them
+            # Owners stay unresolved. The amounts are still valid, but WITHOUT
+            # an owner nothing can be told apart from the bonding curve, and
+            # an unclassified curve silently counts as a whale - the exact
+            # wrong number this classification exists to prevent. The caller
+            # is told, and reports concentration as unknown rather than wrong.
+            pass
 
     holders = []
     for acc in top:
         address = acc.get("address")
         ui_amount = acc.get("uiAmount")
         pct = (ui_amount / supply_ui * 100) if ui_amount is not None and supply_ui else None
+        owner = owners_by_address.get(address)
+        is_program, venue = classify_holder_owner(owner)
         holders.append(HolderInfo(
-            owner=owners_by_address.get(address), token_account=address,
+            owner=owner, token_account=address,
             amount_ui=ui_amount or 0.0, pct_of_supply=pct,
+            is_program_owned=is_program, venue=venue,
         ))
+
+    if holders and not owners_by_address:
+        return holders, (
+            "Could not resolve who owns the largest token accounts, so the "
+            "bonding curve and any AMM pool can't be told apart from real "
+            "wallets - no concentration figure is reported rather than a "
+            "misleading one."
+        )
     return holders, None
 
 
@@ -1227,11 +1287,33 @@ def assess_risk(
     supply_ui = (int(raw_supply) / (10 ** decimals)) if raw_supply is not None else None
 
     top_holders, holder_note = get_top_holders(rpc, mint, supply_ui)
+    owners_unresolved = bool(top_holders) and not any(h.owner for h in top_holders)
     if holder_note:
         notes.append(holder_note)
+    # Concentration means "how much of this is in a few people's hands", so
+    # it has to exclude the bonding curve and AMM pools. Including them made
+    # every token read as 90-100% concentrated, because that IS how a
+    # pump.fun launch works - the curve holds the supply and sells it down.
     top10_pct = None
-    if supply_ui and top_holders:
-        top10_pct = round(sum(h.pct_of_supply or 0 for h in top_holders), 2)
+    pooled_pct = None
+    if supply_ui and top_holders and not owners_unresolved:
+        wallet_holders = [h for h in top_holders if not h.is_program_owned]
+        pooled = [h for h in top_holders if h.is_program_owned]
+        top10_pct = round(sum(h.pct_of_supply or 0 for h in wallet_holders), 2)
+        pooled_pct = round(sum(h.pct_of_supply or 0 for h in pooled), 2) if pooled else None
+        if pooled:
+            venues = sorted({h.venue for h in pooled if h.venue})
+            notes.append(
+                f"{pooled_pct}% of supply sits in {', '.join(venues) or 'program-owned accounts'} "
+                "and is excluded from the concentration figure - that is the launch "
+                "mechanism holding unsold supply, not an insider position."
+            )
+        if not wallet_holders:
+            notes.append(
+                "None of the largest accounts is an individual wallet, so there is "
+                "no wallet-concentration figure to report for this token yet."
+            )
+            top10_pct = None
 
     dev_launches = len(dev_profile.other_launches) if dev_profile else 0
     if dev_profile is not None and not dev_profile.scan_ran:
@@ -1257,9 +1339,15 @@ def assess_risk(
             "tokens, preventing them from selling."
         )
     if top10_pct is not None and top10_pct > RISK_TOP_HOLDER_ELEVATED_PCT:
-        reasons.append(f"Top {TOP_HOLDER_COUNT} wallets hold {top10_pct}% of supply.")
+        reasons.append(
+            f"The largest individual wallets hold {top10_pct}% of supply "
+            "(excluding the bonding curve and any AMM pool)."
+        )
     elif top10_pct is not None and top10_pct > RISK_TOP_HOLDER_CAUTION_PCT:
-        reasons.append(f"Top {TOP_HOLDER_COUNT} wallets hold {top10_pct}% of supply - worth watching.")
+        reasons.append(
+            f"The largest individual wallets hold {top10_pct}% of supply "
+            "(excluding the bonding curve and any AMM pool) - worth watching."
+        )
     if dev_launches >= RISK_SERIAL_DEPLOYER_CAUTION_COUNT:
         reasons.append(f"Dev wallet has launched at least {dev_launches} other tokens recently.")
     elif dev_launches > 0:
@@ -1280,6 +1368,7 @@ def assess_risk(
         supply_ui=supply_ui,
         top_holders=top_holders,
         top10_pct=top10_pct,
+        pooled_pct=pooled_pct,
         dev_other_launches=dev_launches,
         verdict=verdict,
         reasons=reasons,
@@ -1344,7 +1433,132 @@ def check_migration(top_holders: list[HolderInfo]) -> MigrationStatus:
 # --------------------------------------------------------------------------
 
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search"
-NAME_MATCH_LIMIT = 8
+NAME_MATCH_LIMIT = 12
+
+# Characters swapped to make a name read the same while being a different
+# string. This is the actual impersonation technique - "S0LANA" is not
+# "SOLANA" to a string comparison, but it is to a human scrolling a feed.
+_CONFUSABLE_CHARS = str.maketrans({
+    "0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "6": "g",
+    "7": "t", "8": "b", "9": "g", "$": "s", "!": "i", "|": "l",
+    "@": "a", "\u00e9": "e", "\u00e8": "e", "\u00e1": "a", "\u00e0": "a",
+    "\u00ed": "i", "\u00f3": "o", "\u00fa": "u", "\u00f1": "n",
+})
+# Multi-character swaps have to run as string replacements, not translate().
+_CONFUSABLE_PAIRS = (("rn", "m"), ("vv", "w"), ("ii", "u"), ("cl", "d"))
+
+# Below this length, lookalike matching is worse than useless: on a 2-3
+# character ticker almost everything is within one edit of everything else,
+# so it would flag half the chain. Exact matches still count at any length.
+MIN_FUZZY_LENGTH = 4
+
+
+def _normalize_name(value: Optional[str]) -> str:
+    """Case, spacing and punctuation removed - "Dons Coin!" -> "donscoin"."""
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def _fold_lookalike(value: Optional[str]) -> str:
+    """Normalized, then confusable characters collapsed to one spelling."""
+    folded = _normalize_name(value).translate(_CONFUSABLE_CHARS)
+    for pair, replacement in _CONFUSABLE_PAIRS:
+        folded = folded.replace(pair, replacement)
+    # Repeated letters are the cheapest possible disguise ("doonns").
+    out: list[str] = []
+    for ch in folded:
+        if not out or out[-1] != ch:
+            out.append(ch)
+    return "".join(out)
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """True when one insertion, deletion or substitution turns a into b.
+
+    Bounded at distance 1 rather than a general edit-distance score: on
+    short memecoin names anything looser stops discriminating, and a name
+    check that cries wolf gets ignored exactly when it matters.
+    """
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la > lb:
+        a, b, la, lb = b, a, lb, la      # a is now the shorter
+    i = j = 0
+    edited = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+            continue
+        if edited:
+            return False
+        edited = True
+        if la == lb:
+            i += 1
+        j += 1
+    return True
+
+
+# Strongest first - the label a match gets is the strongest one that applies.
+MATCH_SAME_NAME = "same name"
+MATCH_SAME_TICKER = "same ticker"
+MATCH_RESPELLED_NAME = "same name, respelled"
+MATCH_RESPELLED_TICKER = "same ticker, respelled"
+MATCH_LOOKALIKE_NAME = "lookalike name"
+MATCH_LOOKALIKE_TICKER = "lookalike ticker"
+
+# Which match kinds mean another token genuinely holds this identity, as
+# opposed to merely resembling it. Only these justify the headline warning.
+IMPERSONATION_MATCHES = frozenset({
+    MATCH_SAME_NAME, MATCH_SAME_TICKER,
+    MATCH_RESPELLED_NAME, MATCH_RESPELLED_TICKER,
+})
+
+
+def classify_name_match(
+    name: Optional[str], symbol: Optional[str],
+    twin_name: Optional[str], twin_symbol: Optional[str],
+) -> Optional[str]:
+    """How another token's identity collides with this one's, if at all.
+
+    Returns the strongest applicable label, or None when the two are simply
+    different tokens. Checking the ticker as well as the name matters
+    because a copycat usually keeps the ticker - that is the part people
+    type and search for.
+    """
+    name_l, sym_l = (name or "").strip().lower(), (symbol or "").strip().lstrip("$").lower()
+    tname_l = (twin_name or "").strip().lower()
+    tsym_l = (twin_symbol or "").strip().lstrip("$").lower()
+
+    if name_l and tname_l == name_l:
+        return MATCH_SAME_NAME
+    if sym_l and tsym_l == sym_l:
+        return MATCH_SAME_TICKER
+    # Across the two fields as well: a token TICKERED "DONS" collides with a
+    # token NAMED "Dons" just as squarely, and that swap is a common dodge.
+    if name_l and tsym_l == name_l:
+        return MATCH_SAME_TICKER
+    if sym_l and tname_l == sym_l:
+        return MATCH_SAME_NAME
+
+    n_norm, tn_norm = _normalize_name(name), _normalize_name(twin_name)
+    s_norm, ts_norm = _normalize_name(symbol.lstrip("$") if symbol else None), _normalize_name(twin_symbol.lstrip("$") if twin_symbol else None)
+    if n_norm and n_norm == tn_norm:
+        return MATCH_RESPELLED_NAME
+    if s_norm and s_norm == ts_norm:
+        return MATCH_RESPELLED_TICKER
+
+    n_fold, tn_fold = _fold_lookalike(name), _fold_lookalike(twin_name)
+    if n_fold and len(n_fold) >= MIN_FUZZY_LENGTH:
+        if n_fold == tn_fold or _within_one_edit(n_fold, tn_fold):
+            return MATCH_RESPELLED_NAME if n_fold == tn_fold else MATCH_LOOKALIKE_NAME
+    s_fold, ts_fold = _fold_lookalike(symbol), _fold_lookalike(twin_symbol)
+    if s_fold and len(s_fold) >= MIN_FUZZY_LENGTH:
+        if s_fold == ts_fold or _within_one_edit(s_fold, ts_fold):
+            return MATCH_RESPELLED_TICKER if s_fold == ts_fold else MATCH_LOOKALIKE_TICKER
+    return None
 
 
 @dataclass
@@ -1354,6 +1568,11 @@ class NameTwin:
     symbol: Optional[str]
     first_pair_unix: Optional[int]
     first_pair_iso: Optional[str]
+    match: Optional[str] = None       # why this counts as a collision
+
+    @property
+    def is_impersonation(self) -> bool:
+        return self.match in IMPERSONATION_MATCHES
 
     def to_dict(self) -> dict:
         return {
@@ -1362,6 +1581,8 @@ class NameTwin:
             "symbol": self.symbol,
             "first_pair_seen": self.first_pair_iso,
             "first_pair_unix": self.first_pair_unix,
+            "match": self.match,
+            "is_impersonation": self.is_impersonation,
             "chart_url": f"https://dexscreener.com/solana/{self.mint}",
         }
 
@@ -1370,15 +1591,28 @@ class NameTwin:
 class NameCollisions:
     status: str                       # ok | unavailable | skipped
     searched_name: Optional[str] = None
+    searched_symbol: Optional[str] = None
     twins: list[NameTwin] = field(default_factory=list)
     oldest: Optional[NameTwin] = None
     detail: Optional[str] = None
 
+    @property
+    def impersonations(self) -> list[NameTwin]:
+        """Twins that actually hold this identity, not just resemble it."""
+        return [t for t in self.twins if t.is_impersonation]
+
     def to_dict(self) -> dict:
+        matches: dict[str, int] = {}
+        for t in self.twins:
+            if t.match:
+                matches[t.match] = matches.get(t.match, 0) + 1
         return {
             "status": self.status,
             "searched_name": self.searched_name,
+            "searched_symbol": self.searched_symbol,
             "count": len(self.twins),
+            "impersonation_count": len(self.impersonations),
+            "match_breakdown": matches,
             "oldest": self.oldest.to_dict() if self.oldest else None,
             "twins": [t.to_dict() for t in self.twins],
             "detail": self.detail,
@@ -1390,12 +1624,21 @@ class NameCollisions:
         }
 
 
-def find_name_collisions(name: Optional[str], exclude_mint: str) -> NameCollisions:
-    """Other Solana tokens already using this token's name.
+def find_name_collisions(
+    name: Optional[str], exclude_mint: str, symbol: Optional[str] = None
+) -> NameCollisions:
+    """Other Solana tokens sharing or imitating this token's identity.
 
-    A memecoin name is not unique - reusing a name that already ran is a
-    standard impersonation play, and knowing an older token holds the name
-    is exactly the context that "is this the real one?" needs.
+    A memecoin name is not unique, and reusing one that already ran is a
+    standard impersonation play - so is keeping the ticker while changing
+    the name, and so is respelling either one ("S0LANA", "Donss"). All of
+    those are the same attack on a buyer scrolling a feed, so all of them
+    are searched for and each result says WHICH it is: an exact name or
+    ticker collision is a different claim from a lookalike, and collapsing
+    them would either cry wolf or miss the copy.
+
+    Both the name and the ticker are searched, because a copycat usually
+    keeps the ticker - that is the part people type.
 
     There is no on-chain index of token names, so this needs an off-chain
     search; DexScreener's public search endpoint needs no key. Never fatal:
@@ -1403,28 +1646,47 @@ def find_name_collisions(name: Optional[str], exclude_mint: str) -> NameCollisio
     taking down the report, and the timestamps are labelled for what they
     actually are (first pair seen, not mint creation).
     """
-    clean = (name or "").strip()
-    if not clean:
-        return NameCollisions(status="skipped", detail="No token name resolved to search for.")
-
-    url = f"{DEXSCREENER_SEARCH}?{urllib.parse.urlencode({'q': clean})}"
-    try:
-        data = http_json(url, timeout=6, retries=0)
-    except HttpError as exc:
+    clean_name = (name or "").strip()
+    clean_symbol = (symbol or "").strip().lstrip("$")
+    if not clean_name and not clean_symbol:
         return NameCollisions(
-            status="unavailable", searched_name=clean,
-            detail=f"Name search unavailable (DexScreener returned HTTP {exc.status}).",
-        )
-    except Exception as exc:  # noqa: BLE001 - never fatal, it's a bonus signal
-        return NameCollisions(
-            status="unavailable", searched_name=clean,
-            detail=f"Name search unavailable: {squash(str(exc), 120)}",
+            status="skipped",
+            detail="No token name or ticker resolved to search for.",
         )
 
-    lowered = clean.lower()
-    # One token has many pairs; keep the earliest pair seen per mint.
+    # Two queries, deduped: searching the ticker as well as the name is what
+    # catches a copy that kept the ticker and changed the name.
+    queries: list[str] = []
+    for term in (clean_name, clean_symbol):
+        if term and term.lower() not in {q.lower() for q in queries}:
+            queries.append(term)
+
+    pairs: list[dict] = []
+    failures: list[str] = []
+    for term in queries:
+        url = f"{DEXSCREENER_SEARCH}?{urllib.parse.urlencode({'q': term})}"
+        try:
+            data = http_json(url, timeout=6, retries=0)
+        except HttpError as exc:
+            failures.append(f"HTTP {exc.status}")
+            continue
+        except Exception as exc:  # noqa: BLE001 - never fatal, it's a bonus signal
+            failures.append(squash(str(exc), 60))
+            continue
+        pairs.extend((data or {}).get("pairs") or [])
+
+    # Only a total failure is "unavailable". If one query answered, its
+    # results are real and worth showing - with a note that the other
+    # didn't, so a thin result set is never mistaken for a clean one.
+    if len(failures) == len(queries):
+        return NameCollisions(
+            status="unavailable", searched_name=clean_name or None,
+            searched_symbol=clean_symbol or None,
+            detail=f"Name search unavailable (DexScreener returned {failures[0]}).",
+        )
+
     by_mint: dict[str, NameTwin] = {}
-    for pair in (data or {}).get("pairs") or []:
+    for pair in pairs:
         if (pair.get("chainId") or "").lower() != "solana":
             continue
         base = pair.get("baseToken") or {}
@@ -1433,30 +1695,62 @@ def find_name_collisions(name: Optional[str], exclude_mint: str) -> NameCollisio
             continue
         twin_name = (base.get("name") or "").strip()
         twin_symbol = (base.get("symbol") or "").strip()
-        if twin_name.lower() != lowered and twin_symbol.lower() != lowered:
-            continue  # DexScreener matches loosely; only keep real name/symbol hits
+        match = classify_name_match(clean_name, clean_symbol, twin_name, twin_symbol)
+        if not match:
+            continue  # DexScreener matches loosely; an unrelated token is not a twin
 
         created_ms = pair.get("pairCreatedAt")
         created_unix = int(created_ms / 1000) if created_ms else None
         existing = by_mint.get(address)
-        if existing and existing.first_pair_unix is not None:
-            if created_unix is None or created_unix >= existing.first_pair_unix:
+        if existing:
+            # One token has many pairs: keep its earliest, and keep the
+            # strongest reason it collides with ours.
+            if existing.match and match in IMPERSONATION_MATCHES and existing.match not in IMPERSONATION_MATCHES:
+                existing.match = match
+            if existing.first_pair_unix is not None and (
+                created_unix is None or created_unix >= existing.first_pair_unix
+            ):
                 continue
+            existing.first_pair_unix = created_unix
+            existing.first_pair_iso = iso(utc_from_unix(created_unix)) if created_unix else None
+            continue
         by_mint[address] = NameTwin(
             mint=address, name=twin_name or None, symbol=twin_symbol or None,
             first_pair_unix=created_unix,
             first_pair_iso=iso(utc_from_unix(created_unix)) if created_unix else None,
+            match=match,
         )
 
+    # Outright collisions first, then oldest first - an older token holding
+    # the actual name is the thing a buyer most needs to see, and a mere
+    # lookalike should never push it off the end of the list.
     twins = sorted(
         by_mint.values(),
-        key=lambda t: (t.first_pair_unix is None, t.first_pair_unix or 0),
+        key=lambda t: (
+            not t.is_impersonation,
+            t.first_pair_unix is None,
+            t.first_pair_unix or 0,
+        ),
     )
-    oldest = next((t for t in twins if t.first_pair_unix is not None), None)
+    # The headline is about a token that genuinely holds this identity, so
+    # the "oldest" is the oldest impersonation, not the oldest lookalike.
+    dated_impersonations = [
+        t for t in twins if t.is_impersonation and t.first_pair_unix is not None
+    ]
+    oldest = min(dated_impersonations, key=lambda t: t.first_pair_unix) if dated_impersonations else None
+
+    detail = None
+    if not twins:
+        detail = "No other Solana token found using this name or ticker."
+    if failures:
+        detail = ((detail + " ") if detail else "") + (
+            f"One of the two searches ({len(failures)} of {len(queries)}) didn't "
+            "complete, so this list may be incomplete."
+        )
     return NameCollisions(
-        status="ok", searched_name=clean,
-        twins=twins[:NAME_MATCH_LIMIT], oldest=oldest,
-        detail=None if twins else "No other Solana token found using this name.",
+        status="ok", searched_name=clean_name or None,
+        searched_symbol=clean_symbol or None,
+        twins=twins[:NAME_MATCH_LIMIT], oldest=oldest, detail=detail,
     )
 
 
@@ -2297,7 +2591,9 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
             print(f"  {'Mint authority':<18}{mint_line}")
             print(f"  {'Freeze authority':<18}{freeze_line}")
         if risk["top10_holder_pct"] is not None:
-            print(f"  {'Top 10 holders':<18}{risk['top10_holder_pct']}% of supply")
+            print(f"  {'Top wallets':<18}{risk['top10_holder_pct']}% of supply  {dim('(individual wallets only)')}")
+        if risk.get("pooled_pct") is not None:
+            print(f"  {'In curve/pool':<18}{dim(str(risk['pooled_pct']) + '% of supply - not an insider position')}")
         if risk["dev_other_launches"]:
             print(f"  {'Dev launches':<18}{risk['dev_other_launches']} other token(s) found")
         for reason in risk["reasons"]:
@@ -2369,18 +2665,33 @@ def render(report: dict, triage: Triage, outcome: SearchOutcome, origin: OnChain
     nc = report.get("name_collisions")
     if nc and nc.get("status") == "ok":
         count = nc.get("count") or 0
-        section(f"name check  ({count} other token(s) using this name)")
+        real = nc.get("impersonation_count") or 0
+        searched = " / ".join(x for x in (
+            nc.get("searched_name"),
+            ("$" + nc["searched_symbol"]) if nc.get("searched_symbol") else None,
+        ) if x)
+        section(f"name check  ({real} using this identity, {count - real} lookalike(s))")
         if not count:
-            print(green("  No other Solana token found using this name."))
+            print(green("  No other Solana token found using this name or ticker."))
         else:
             oldest = nc.get("oldest")
             if oldest:
-                print(f"  {yellow('!')} An older token already uses this name: "
+                print(f"  {yellow('!')} An older token already uses this identity: "
                       f"{bold(oldest.get('name') or '?')} "
                       f"{dim('first traded ' + (oldest.get('first_pair_seen') or '?'))}")
                 print(dim(f"      {oldest.get('mint')}"))
-            for twin in (nc.get("twins") or [])[1:6]:
-                print(dim(f"  - {twin.get('mint')}  {twin.get('first_pair_seen') or '?'}"))
+            else:
+                print(dim("  Nothing holds this exact name or ticker - the below only resemble it."))
+            for twin in (nc.get("twins") or [])[:6]:
+                if oldest and twin.get("mint") == oldest.get("mint"):
+                    continue
+                marker = yellow("!") if twin.get("is_impersonation") else dim("~")
+                label = twin.get("match") or "similar"
+                name = twin.get("name") or "?"
+                sym = f" (${twin['symbol']})" if twin.get("symbol") else ""
+                print(f"  {marker} {name}{sym}  {dim(label)}")
+                print(dim(f"      {twin.get('mint')}  {twin.get('first_pair_seen') or 'date unknown'}"))
+            print(dim(f"  Searched {searched} across names and tickers, including respellings."))
             print(dim(f"  {nc.get('caveat')}"))
     elif nc and nc.get("status") == "unavailable":
         section("name check")
@@ -2756,10 +3067,11 @@ def run_analysis(ca: str, args: argparse.Namespace) -> tuple[dict, Triage, Searc
     collisions: Optional[NameCollisions] = None
     if not getattr(args, "no_name_check", False):
         if budget.can_afford(COST_NAME_CHECK):
-            collisions = find_name_collisions(identity.name, ca)
+            collisions = find_name_collisions(identity.name, ca, identity.symbol)
         else:
             collisions = NameCollisions(
                 status="unavailable", searched_name=identity.name,
+                searched_symbol=identity.symbol,
                 detail=budget.note_skip("Name check"),
             )
 
